@@ -1,10 +1,13 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
+    alloc::Layout,
     cell::Cell,
     mem, ptr,
     sync::atomic::{AtomicUsize, Ordering},
 };
+
+use crate::list::USIZE;
 
 const ADDR_ALIGN_MASK: usize = 7;
 
@@ -36,8 +39,8 @@ pub fn without_tag(offset: usize) -> usize {
 }
 
 impl Arena {
-    pub fn with_capacity(cap: usize) -> Arena {
-        let mut buf: Vec<u64> = Vec::with_capacity(cap / 8);
+    pub fn with_capacity(_cap: usize) -> Arena {
+        let mut buf: Vec<u64> = Vec::with_capacity(0);
         let ptr = buf.as_mut_ptr() as *mut u8;
         let cap = buf.capacity() * 8;
         mem::forget(buf);
@@ -60,40 +63,8 @@ impl Arena {
 
     /// Alloc 8-byte aligned memory.
     pub fn alloc(&self, size: usize) -> usize {
-        // Leave enough padding for alignment.
-        let size = (size + ADDR_ALIGN_MASK) & !ADDR_ALIGN_MASK;
-        let offset = self.len.fetch_add(size, Ordering::SeqCst);
-
-        // Grow the arena if there is no enough space
-        if offset + size > self.cap.get() {
-            // some bug with this method, so panic directly
-            panic!("not support now");
-            // // Alloc new buf and copy data to new buf
-            // let mut grow_by = self.cap.get();
-            // if grow_by > 1 << 30 {
-            //     grow_by = 1 << 30;
-            // }
-            // if grow_by < size {
-            //     grow_by = size;
-            // }
-            // let mut new_buf: Vec<u64> = Vec::with_capacity((self.cap.get() + grow_by) / 8);
-            // let new_ptr = new_buf.as_mut_ptr() as *mut u8;
-            // unsafe {
-            //     ptr::copy_nonoverlapping(new_ptr, self.ptr.get(), self.cap.get());
-            // }
-
-            // // Release old buf
-            // let old_ptr = self.ptr.get() as *mut u64;
-            // unsafe {
-            //     Vec::from_raw_parts(old_ptr, 0, self.cap.get() / 8);
-            // }
-
-            // // Use new buf
-            // self.ptr.set(new_ptr);
-            // self.cap.set(new_buf.capacity() * 8);
-            // mem::forget(new_buf);
-        }
-        offset
+        let layout = Layout::from_size_align(size, USIZE).unwrap();
+        unsafe { std::alloc::alloc(layout) as usize }
     }
 
     pub unsafe fn get_mut<N>(&self, offset: usize) -> *mut N {
@@ -102,17 +73,11 @@ impl Arena {
             return ptr::null_mut();
         }
 
-        self.ptr.get().add(offset) as _
+        offset as _
     }
 
     pub fn offset<N>(&self, ptr: *const N) -> usize {
-        let ptr_addr = ptr as usize;
-        let self_addr = self.ptr.get() as usize;
-        if ptr_addr > self_addr && ptr_addr < self_addr + self.cap.get() {
-            ptr_addr - self_addr
-        } else {
-            0
-        }
+        ptr as usize
     }
 }
 

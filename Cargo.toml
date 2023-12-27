@@ -9,3 +9,6 @@ edition = "2021"
 bytes = "1.0"
 rand = "0.8.4"
 slog = "2.2"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.5"

@@ -2,6 +2,7 @@
 
 use core::slice::SlicePattern;
 use std::{
+    alloc::{GlobalAlloc, Layout},
     cmp, mem,
     ops::Deref,
     ptr,
@@ -17,7 +18,10 @@ use bytes::Bytes;
 use rand::Rng;
 
 use super::{arena::Arena, KeyComparator, MAX_HEIGHT};
-use crate::arena::{tag, without_tag};
+use crate::{
+    arena::{tag, without_tag},
+    GLOBAL,
+};
 
 const HEIGHT_INCREASE: u32 = u32::MAX / 3;
 pub const MAX_NODE_SIZE: usize = mem::size_of::<Node>();
@@ -50,6 +54,8 @@ pub struct Node {
     prev: AtomicUsize,
     tower: [AtomicUsize; MAX_HEIGHT],
 }
+
+pub const USIZE: usize = mem::size_of::<AtomicUsize>();
 
 impl Node {
     fn alloc(arena: &Arena, key: Bytes, value: Bytes, height: usize) -> usize {
@@ -995,7 +1001,7 @@ mod tests {
         let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
         let mut i = 0;
 
-        let num = 1000000;
+        let num = 10000000;
         while i < num {
             let key = Bytes::from(format!("key{:08}", i));
             let value = Bytes::from(format!("value{:08}", i));
