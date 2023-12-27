@@ -7,9 +7,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::list::USIZE;
-
-const ADDR_ALIGN_MASK: usize = 7;
+use crate::list::{NodeSize, U_SIZE};
 
 // Thread-local Arena
 pub struct Arena {
@@ -63,8 +61,19 @@ impl Arena {
 
     /// Alloc 8-byte aligned memory.
     pub fn alloc(&self, size: usize) -> usize {
-        let layout = Layout::from_size_align(size, USIZE).unwrap();
+        let layout = Layout::from_size_align(size, U_SIZE).unwrap();
         unsafe { std::alloc::alloc(layout) as usize }
+    }
+
+    pub fn free<N: NodeSize>(&self, node_addr: *mut N) {
+        let size = {
+            let node = unsafe { &(*node_addr) };
+            node.size()
+        };
+        let layout = Layout::from_size_align(size, U_SIZE).unwrap();
+        unsafe {
+            std::alloc::dealloc(node_addr as *mut u8, layout);
+        }
     }
 
     pub unsafe fn get_mut<N>(&self, offset: usize) -> *mut N {

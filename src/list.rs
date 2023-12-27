@@ -2,7 +2,7 @@
 
 use core::slice::SlicePattern;
 use std::{
-    alloc::{GlobalAlloc, Layout},
+    alloc::GlobalAlloc,
     cmp, mem,
     ops::Deref,
     ptr,
@@ -18,10 +18,7 @@ use bytes::Bytes;
 use rand::Rng;
 
 use super::{arena::Arena, KeyComparator, MAX_HEIGHT};
-use crate::{
-    arena::{tag, without_tag},
-    GLOBAL,
-};
+use crate::arena::{tag, without_tag};
 
 const HEIGHT_INCREASE: u32 = u32::MAX / 3;
 pub const MAX_NODE_SIZE: usize = mem::size_of::<Node>();
@@ -55,14 +52,25 @@ pub struct Node {
     tower: [AtomicUsize; MAX_HEIGHT],
 }
 
-pub const USIZE: usize = mem::size_of::<AtomicUsize>();
+pub const U_SIZE: usize = mem::size_of::<AtomicUsize>();
+pub const NODE_SIZE: usize = mem::size_of::<Node>();
+
+pub trait NodeSize {
+    fn size(&self) -> usize;
+}
+
+impl NodeSize for Node {
+    fn size(&self) -> usize {
+        let not_used = (MAX_HEIGHT - self.height - 1) * U_SIZE;
+        NODE_SIZE - not_used
+    }
+}
 
 impl Node {
     fn alloc(arena: &Arena, key: Bytes, value: Bytes, height: usize) -> usize {
-        let size = mem::size_of::<Node>();
         // Not all values in Node::tower will be utilized.
-        let not_used = (MAX_HEIGHT - height - 1) * mem::size_of::<AtomicUsize>();
-        let node_offset = arena.alloc(size - not_used);
+        let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
+        let node_offset = arena.alloc(NODE_SIZE - not_used);
         unsafe {
             let node_ptr: *mut Node = arena.get_mut(node_offset);
             let node = &mut *node_ptr;
@@ -441,7 +449,9 @@ impl<C: KeyComparator> Skiplist<C> {
                         }
                     }
 
-                    return Some((*n).value.clone());
+                    let value = Some((*n).value.clone());
+                    self.inner.arena.free(n);
+                    return value;
                 }
             }
         }
@@ -842,6 +852,8 @@ fn below_upper_bound<C: KeyComparator>(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::{key::ByteWiseComparator, FixedLengthSuffixComparator};
 
@@ -982,7 +994,8 @@ mod tests {
         iter.seek_to_first();
         while iter.valid() {
             let key = iter.key();
-            sklist.remove(key.as_slice());
+            let a = sklist.remove(key.as_slice());
+            println!("{:?}", a);
             iter.next();
         }
 
@@ -1076,6 +1089,56 @@ mod tests {
             count += 1;
         }
         println!("{}", count);
+    }
+
+    #[test]
+    fn test_iter_remove4() {
+        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
+        let mut i = 0;
+        let num = 1000000;
+        while i < num {
+            let key = Bytes::from(format!("key{:010}", i));
+            let value = Bytes::from(format!("valuevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevalue{:010}", i));
+            sklist.put(key.clone(), value);
+            // sklist.remove(key.as_slice());
+
+            if i % 100000 == 0 {
+                println!("progress: {}", i);
+            }
+            i += 1;
+        }
+
+        let mut removed = vec![];
+        let mut iter = sklist.iter();
+        iter.seek_to_first();
+        let mut i = 0;
+        while iter.valid() {
+            let key = iter.key();
+            let a = sklist.remove(key.as_slice());
+            removed.push(a);
+            iter.next();
+
+            if i % 100000 == 0 {
+                std::thread::sleep(Duration::from_millis(500));
+                println!("remove progress: {}", i);
+            }
+            i += 1;
+        }
+
+        std::thread::sleep(Duration::from_secs(5));
+
+        for m in removed {
+            println!("{:?}", m);
+        }
+
+        let mut iter = sklist.iter();
+        iter.seek_to_first();
+        let mut count = 0;
+        while iter.valid() {
+            count += 1;
+            iter.next();
+        }
+        assert!(count == 0);
     }
 
     #[test]
