@@ -2,7 +2,6 @@
 
 use core::slice::SlicePattern;
 use std::{
-    alloc::GlobalAlloc,
     cmp, mem,
     ops::Deref,
     ptr,
@@ -55,19 +54,34 @@ pub struct Node {
 pub const U_SIZE: usize = mem::size_of::<AtomicUsize>();
 pub const NODE_SIZE: usize = mem::size_of::<Node>();
 
-pub trait NodeSize {
+pub trait ReclaimableNode {
     fn size(&self) -> usize;
+
+    fn drop_key_value(&mut self);
 }
 
-impl NodeSize for Node {
+impl ReclaimableNode for Node {
     fn size(&self) -> usize {
         let not_used = (MAX_HEIGHT - self.height - 1) * U_SIZE;
         NODE_SIZE - not_used
     }
+
+    fn drop_key_value(&mut self) {
+        unsafe {
+            ptr::drop_in_place(&mut self.key);
+            ptr::drop_in_place(&mut self.value);
+        }
+    }
+}
+
+pub trait MemoryLimiter: Clone {
+    fn acquire(&self, n: usize) -> bool;
+    fn reclaim(&self, n: usize);
+    fn mem_usage(&self) -> usize;
 }
 
 impl Node {
-    fn alloc(arena: &Arena, key: Bytes, value: Bytes, height: usize) -> usize {
+    fn alloc<M: MemoryLimiter>(arena: &Arena<M>, key: Bytes, value: Bytes, height: usize) -> usize {
         // Not all values in Node::tower will be utilized.
         let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
         let node_offset = arena.alloc(NODE_SIZE - not_used);
@@ -103,22 +117,24 @@ impl Node {
     }
 }
 
-struct SkiplistInner {
+struct SkiplistInner<M: MemoryLimiter> {
     height: AtomicUsize,
     head: NonNull<Node>,
-    arena: Arena,
+    arena: Arena<M>,
 }
+
+unsafe impl<M: MemoryLimiter> Send for SkiplistInner<M> {}
+unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
 
 #[derive(Clone)]
-pub struct Skiplist<C: Clone> {
-    inner: Arc<SkiplistInner>,
+pub struct Skiplist<C: Clone, M: MemoryLimiter> {
+    inner: Arc<SkiplistInner<M>>,
     c: C,
-    allow_concurrent_write: bool,
 }
 
-impl<C: Clone> Skiplist<C> {
-    pub fn with_capacity(c: C, arena_size: usize, allow_concurrent_write: bool) -> Skiplist<C> {
-        let arena = Arena::with_capacity(arena_size);
+impl<C: Clone, M: MemoryLimiter> Skiplist<C, M> {
+    pub fn new(c: C, mem_limiter: M) -> Skiplist<C, M> {
+        let arena = Arena::new(mem_limiter);
         let head_offset = Node::alloc(&arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
         let head = unsafe { NonNull::new_unchecked(arena.get_mut(head_offset)) };
         Skiplist {
@@ -128,7 +144,6 @@ impl<C: Clone> Skiplist<C> {
                 arena,
             }),
             c,
-            allow_concurrent_write,
         }
     }
 
@@ -147,7 +162,7 @@ impl<C: Clone> Skiplist<C> {
     }
 }
 
-impl<C: KeyComparator> Skiplist<C> {
+impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     /// Finds the node near to key.
     ///
     /// If less=true, it finds rightmost node such that node.key < key (if
@@ -234,17 +249,13 @@ impl<C: KeyComparator> Skiplist<C> {
         }
     }
 
-    pub fn split(&self, split_keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C>> {
+    pub fn split(&self, split_keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
         let num = split_keys.len();
         let mut sklists = vec![];
         let mut iter = self.iter();
         iter.seek_to_first();
         for split_key in split_keys {
-            let sk = Skiplist::with_capacity(
-                self.c.clone(),
-                self.inner.arena.cap(),
-                self.allow_concurrent_write,
-            );
+            let sk = Skiplist::new(self.c.clone(), self.inner.arena.limiter.clone());
 
             while iter.valid()
                 && self.c.compare_key(iter.key().as_slice(), split_key) == std::cmp::Ordering::Less
@@ -255,11 +266,7 @@ impl<C: KeyComparator> Skiplist<C> {
             sklists.push(sk);
         }
 
-        let sk = Skiplist::with_capacity(
-            self.c.clone(),
-            self.inner.arena.cap(),
-            self.allow_concurrent_write,
-        );
+        let sk = Skiplist::new(self.c.clone(), self.inner.arena.limiter.clone());
         while iter.valid() {
             sk.put(iter.key().clone(), iter.value().clone());
             iter.next();
@@ -329,11 +336,9 @@ impl<C: KeyComparator> Skiplist<C> {
                             break;
                         }
                         found = Some(curr_node);
-                    } else {
-                        if above_lower_bound(&self.c, key, &(*curr_node).key, allow_equal) {
-                            found = Some(curr_node);
-                            break;
-                        }
+                    } else if above_lower_bound(&self.c, key, &(*curr_node).key, allow_equal) {
+                        found = Some(curr_node);
+                        break;
                     }
 
                     // Move one step forward.
@@ -462,22 +467,14 @@ impl<C: KeyComparator> Skiplist<C> {
         let mut list_height = self.height();
         unsafe {
             let mut search;
-            loop {
-                // First try searching for the key.
-                // Note that the `Ord` implementation for `K` may panic during the search.
-                search = self.search_position(&key);
-                let r = match search.found {
-                    Some(r) => r,
-                    None => break,
-                };
-
-                if (*r).value != value {
-                    // If a node with the key was found and we should replace
-                    // it, mark its tower and then repeat
-                    // the search. todo: concurrent issue?
-                    // (*r).value = value;
-                }
-                return None;
+            // First try searching for the key.
+            // Note that the `Ord` implementation for `K` may panic during the search.
+            search = self.search_position(&key);
+            if let Some(r) = search.found {
+                panic!(
+                    "Overwrite should not occur due to sequence number, {:?}",
+                    (*r).key
+                );
             }
 
             let height = self.random_height();
@@ -650,34 +647,36 @@ impl<C: KeyComparator> Skiplist<C> {
         None
     }
 
-    pub fn iter_ref(&self) -> IterRef<&Skiplist<C>, C> {
+    pub fn iter_ref(&self) -> IterRef<&Skiplist<C, M>, C, M> {
         IterRef {
             list: self,
             cursor: NodeWrap(ptr::null()),
             _key_cmp: std::marker::PhantomData,
+            _limiter: std::marker::PhantomData,
         }
     }
 
-    pub fn iter(&self) -> IterRef<Skiplist<C>, C> {
+    pub fn iter(&self) -> IterRef<Skiplist<C, M>, C, M> {
         IterRef {
             list: self.clone(),
             cursor: NodeWrap(ptr::null()),
             _key_cmp: std::marker::PhantomData,
+            _limiter: std::marker::PhantomData,
         }
     }
 
     pub fn mem_size(&self) -> usize {
-        self.inner.arena.len()
+        self.inner.arena.limiter.mem_usage()
     }
 }
 
-impl<C: Clone> AsRef<Skiplist<C>> for Skiplist<C> {
-    fn as_ref(&self) -> &Skiplist<C> {
+impl<C: Clone, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M> {
+    fn as_ref(&self) -> &Skiplist<C, M> {
         self
     }
 }
 
-impl Drop for SkiplistInner {
+impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
         let mut node = self.head.as_ptr();
         loop {
@@ -696,8 +695,8 @@ impl Drop for SkiplistInner {
     }
 }
 
-unsafe impl<C: Send + Clone> Send for Skiplist<C> {}
-unsafe impl<C: Sync + Clone> Sync for Skiplist<C> {}
+unsafe impl<C: Send + Clone, M: MemoryLimiter> Send for Skiplist<C, M> {}
+unsafe impl<C: Sync + Clone, M: MemoryLimiter> Sync for Skiplist<C, M> {}
 
 pub struct NodeWrap(*const Node);
 unsafe impl Send for NodeWrap {}
@@ -710,16 +709,17 @@ impl Deref for NodeWrap {
     }
 }
 
-pub struct IterRef<T, C: Clone>
+pub struct IterRef<T, C: Clone, M: MemoryLimiter>
 where
-    T: AsRef<Skiplist<C>>,
+    T: AsRef<Skiplist<C, M>>,
 {
     list: T,
     cursor: NodeWrap,
     _key_cmp: std::marker::PhantomData<C>,
+    _limiter: std::marker::PhantomData<M>,
 }
 
-impl<T: AsRef<Skiplist<C>>, C: KeyComparator> IterRef<T, C> {
+impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C, M> {
     pub fn valid(&self) -> bool {
         !self.cursor.is_null()
     }
@@ -758,8 +758,7 @@ impl<T: AsRef<Skiplist<C>>, C: KeyComparator> IterRef<T, C> {
                 self.list
                     .as_ref()
                     .search_bound(self.key(), true, false)
-                    .or_else(|| Some(ptr::null_mut()))
-                    .unwrap(),
+                    .unwrap_or(ptr::null_mut()),
             );
         }
     }
@@ -770,8 +769,7 @@ impl<T: AsRef<Skiplist<C>>, C: KeyComparator> IterRef<T, C> {
                 self.list
                     .as_ref()
                     .search_bound(target, false, true)
-                    .or_else(|| Some(ptr::null_mut()))
-                    .unwrap(),
+                    .unwrap_or(ptr::null_mut()),
             );
         }
     }
@@ -782,8 +780,7 @@ impl<T: AsRef<Skiplist<C>>, C: KeyComparator> IterRef<T, C> {
                 self.list
                     .as_ref()
                     .search_bound(target, true, true)
-                    .or_else(|| Some(ptr::null_mut()))
-                    .unwrap(),
+                    .unwrap_or(ptr::null_mut()),
             );
         }
     }
@@ -818,15 +815,12 @@ fn above_lower_bound<C: KeyComparator>(
     allow_equal: bool,
 ) -> bool {
     if allow_equal {
-        match c.compare_key(other, bound) {
-            cmp::Ordering::Greater | cmp::Ordering::Equal => return true,
-            _ => return false,
-        }
+        matches!(
+            c.compare_key(other, bound),
+            cmp::Ordering::Greater | cmp::Ordering::Equal
+        )
     } else {
-        match c.compare_key(other, bound) {
-            cmp::Ordering::Greater => return true,
-            _ => return false,
-        }
+        matches!(c.compare_key(other, bound), cmp::Ordering::Greater)
     }
 }
 
@@ -838,38 +832,46 @@ fn below_upper_bound<C: KeyComparator>(
     allow_equal: bool,
 ) -> bool {
     if allow_equal {
-        match c.compare_key(bound, other) {
-            cmp::Ordering::Greater | cmp::Ordering::Equal => return true,
-            _ => return false,
-        }
+        matches!(
+            c.compare_key(bound, other),
+            cmp::Ordering::Greater | cmp::Ordering::Equal
+        )
     } else {
-        match c.compare_key(bound, other) {
-            cmp::Ordering::Greater => return true,
-            _ => return false,
-        }
+        matches!(c.compare_key(bound, other), cmp::Ordering::Greater)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{alloc::Layout, collections::HashSet};
 
     use super::*;
-    use crate::{key::ByteWiseComparator, FixedLengthSuffixComparator};
+    use crate::{fetch_stats, key::ByteWiseComparator, FixedLengthSuffixComparator, ReadableSize};
 
-    const ARENA_SIZE: usize = 1 << 20;
+    #[derive(Clone, Default)]
+    struct DummyLimiter {}
 
-    fn with_skl_test(
-        allow_concurrent_write: bool,
-        f: impl FnOnce(Skiplist<FixedLengthSuffixComparator>),
-    ) {
+    impl MemoryLimiter for DummyLimiter {
+        fn acquire(&self, _n: usize) -> bool {
+            true
+        }
+
+        fn mem_usage(&self) -> usize {
+            0
+        }
+
+        fn reclaim(&self, _n: usize) {}
+    }
+
+    fn with_skl_test(f: impl FnOnce(Skiplist<FixedLengthSuffixComparator, DummyLimiter>)) {
         let comp = FixedLengthSuffixComparator::new(8);
-        let list = Skiplist::with_capacity(comp, ARENA_SIZE, allow_concurrent_write);
+        let list = Skiplist::new(comp, DummyLimiter::default());
         f(list);
     }
 
-    fn test_find_near_imp(allow_concurrent_write: bool) {
-        with_skl_test(allow_concurrent_write, |list| {
+    #[test]
+    fn test_skl_find_near() {
+        with_skl_test(|list| {
             for i in 0..1000 {
                 let key = Bytes::from(format!("{:05}{:08}", i * 10 + 5, 0));
                 let value = Bytes::from(format!("{:05}", i));
@@ -919,14 +921,8 @@ mod tests {
     }
 
     #[test]
-    fn test_skl_find_near() {
-        test_find_near_imp(true);
-        test_find_near_imp(false);
-    }
-
-    #[test]
     fn test_skl_remove() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 20, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         for i in 0..30 {
             let key = Bytes::from(format!("key{:03}", i));
             let value = Bytes::from(format!("value{:03}", i));
@@ -980,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_iter_remove() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
         let num = 10;
         while i < num {
@@ -1011,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_skl_remove2() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
 
         let num = 10000000;
@@ -1062,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_skl_remove3() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
         while i < 10000 {
             let key = Bytes::from(format!("key{:05}", i));
@@ -1093,43 +1089,56 @@ mod tests {
 
     #[test]
     fn test_iter_remove4() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 30, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
-        let num = 1000000;
+        let num = 100000000;
         while i < num {
             let key = Bytes::from(format!("key{:010}", i));
-            let value = Bytes::from(format!("valuevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevalue{:010}", i));
+            let value = Bytes::from(format!("valuevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevalu{:010}", i));
             sklist.put(key.clone(), value);
-            // sklist.remove(key.as_slice());
+            sklist.remove(key.as_slice());
 
-            if i % 100000 == 0 {
+            if i % 50000 == 0 {
                 println!("progress: {}", i);
+
+                let stats = fetch_stats().unwrap().unwrap();
+                for (name, n) in stats {
+                    println!("{:?}, {} kb", name, ReadableSize(n as u64).as_kb());
+                }
+
+                let mut iter = sklist.iter();
+                iter.seek_to_first();
+                while iter.valid() {
+                    iter.next();
+                }
+
+                println!();
             }
             i += 1;
         }
 
-        let mut removed = vec![];
-        let mut iter = sklist.iter();
-        iter.seek_to_first();
-        let mut i = 0;
-        while iter.valid() {
-            let key = iter.key();
-            let a = sklist.remove(key.as_slice());
-            removed.push(a);
-            iter.next();
+        // let mut removed = vec![];
+        // let mut iter = sklist.iter();
+        // iter.seek_to_first();
+        // let mut i = 0;
+        // while iter.valid() {
+        //     let key = iter.key();
+        //     let a = sklist.remove(key.as_slice());
+        //     removed.push(a);
+        //     iter.next();
 
-            if i % 100000 == 0 {
-                std::thread::sleep(Duration::from_millis(500));
-                println!("remove progress: {}", i);
-            }
-            i += 1;
-        }
+        //     if i % 100000 == 0 {
+        //         std::thread::sleep(Duration::from_millis(500));
+        //         println!("remove progress: {}", i);
+        //     }
+        //     i += 1;
+        // }
 
-        std::thread::sleep(Duration::from_secs(5));
+        // std::thread::sleep(Duration::from_secs(5));
 
-        for m in removed {
-            println!("{:?}", m);
-        }
+        // for m in removed {
+        //     println!("{:?}", m);
+        // }
 
         let mut iter = sklist.iter();
         iter.seek_to_first();
@@ -1142,8 +1151,35 @@ mod tests {
     }
 
     #[test]
+    fn test_x() {
+        let mut rng = rand::thread_rng();
+        let mut s: HashSet<usize> = HashSet::default();
+        for i in 0..100000000 {
+            let n: usize = rng.gen();
+            let layout = Layout::from_size_align(n % 10001 + 100, 8).unwrap();
+            let addr = unsafe { std::alloc::alloc(layout.clone()) };
+            // println!("{:?}", addr);
+            s.insert(addr as usize);
+            unsafe {
+                std::alloc::dealloc(addr, layout);
+            }
+
+            if i % 500000 == 0 {
+                println!("progress: {}", i);
+
+                let stats = fetch_stats().unwrap().unwrap();
+                for (name, n) in stats {
+                    println!("{:?}, {} mb", name, ReadableSize(n as u64).as_mb());
+                }
+
+                println!("total {}", s.len());
+            }
+        }
+    }
+
+    #[test]
     fn test_split() {
-        let sklist = Skiplist::with_capacity(ByteWiseComparator {}, 1 << 20, true);
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         for i in 0..100 {
             let key = Bytes::from(format!("key{:03}", i));
             let value = Bytes::from(format!("value{:03}", i));
