@@ -1,28 +1,11 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{
-    cell::Cell,
-    mem, ptr,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{alloc::Layout, ptr};
 
-const ADDR_ALIGN_MASK: usize = 7;
+use crate::list::{MemoryLimiter, ReclaimableNode, U_SIZE};
 
-// Thread-local Arena
-pub struct Arena {
-    len: AtomicUsize,
-    cap: Cell<usize>,
-    ptr: Cell<*mut u8>,
-}
-
-impl Drop for Arena {
-    fn drop(&mut self) {
-        let ptr = self.ptr.get() as *mut u64;
-        let cap = self.cap.get() / 8;
-        unsafe {
-            Vec::from_raw_parts(ptr, 0, cap);
-        }
-    }
+pub struct Arena<M: MemoryLimiter> {
+    pub limiter: M,
 }
 
 static NO_TAG: usize = !((1 << 3) /* alignment */ - 1);
@@ -35,65 +18,32 @@ pub fn without_tag(offset: usize) -> usize {
     offset & NO_TAG
 }
 
-impl Arena {
-    pub fn with_capacity(cap: usize) -> Arena {
-        let mut buf: Vec<u64> = Vec::with_capacity(cap / 8);
-        let ptr = buf.as_mut_ptr() as *mut u8;
-        let cap = buf.capacity() * 8;
-        mem::forget(buf);
-        Arena {
-            // Offset 0 is invalid value for func `offset` and `get_mut`, initialize the
-            // len 8 to guarantee the allocated memory addr is always align with 8 bytes.
-            len: AtomicUsize::new(8),
-            cap: Cell::new(cap),
-            ptr: Cell::new(ptr),
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::SeqCst)
-    }
-
-    pub fn cap(&self) -> usize {
-        self.cap.get()
+impl<M: MemoryLimiter> Arena<M> {
+    pub fn new(limiter: M) -> Self {
+        Arena { limiter }
     }
 
     /// Alloc 8-byte aligned memory.
     pub fn alloc(&self, size: usize) -> usize {
-        // Leave enough padding for alignment.
-        let size = (size + ADDR_ALIGN_MASK) & !ADDR_ALIGN_MASK;
-        let offset = self.len.fetch_add(size, Ordering::SeqCst);
+        // todo: alloc returns Result
+        assert!(self.limiter.acquire(size));
 
-        // Grow the arena if there is no enough space
-        if offset + size > self.cap.get() {
-            // some bug with this method, so panic directly
-            panic!("not support now");
-            // // Alloc new buf and copy data to new buf
-            // let mut grow_by = self.cap.get();
-            // if grow_by > 1 << 30 {
-            //     grow_by = 1 << 30;
-            // }
-            // if grow_by < size {
-            //     grow_by = size;
-            // }
-            // let mut new_buf: Vec<u64> = Vec::with_capacity((self.cap.get() + grow_by) / 8);
-            // let new_ptr = new_buf.as_mut_ptr() as *mut u8;
-            // unsafe {
-            //     ptr::copy_nonoverlapping(new_ptr, self.ptr.get(), self.cap.get());
-            // }
+        let layout = Layout::from_size_align(size, U_SIZE).unwrap();
+        unsafe { std::alloc::alloc(layout) as usize }
+    }
 
-            // // Release old buf
-            // let old_ptr = self.ptr.get() as *mut u64;
-            // unsafe {
-            //     Vec::from_raw_parts(old_ptr, 0, self.cap.get() / 8);
-            // }
+    pub fn free<N: ReclaimableNode>(&self, node_addr: *mut N) {
+        let size = {
+            let node = unsafe { &(*node_addr) };
+            node.size()
+        };
 
-            // // Use new buf
-            // self.ptr.set(new_ptr);
-            // self.cap.set(new_buf.capacity() * 8);
-            // mem::forget(new_buf);
+        let layout = Layout::from_size_align(size, U_SIZE).unwrap();
+        unsafe {
+            (*node_addr).drop_key_value();
+            std::alloc::dealloc(node_addr as *mut u8, layout);
         }
-        offset
+        self.limiter.reclaim(size);
     }
 
     pub unsafe fn get_mut<N>(&self, offset: usize) -> *mut N {
@@ -102,39 +52,10 @@ impl Arena {
             return ptr::null_mut();
         }
 
-        self.ptr.get().add(offset) as _
+        offset as _
     }
 
     pub fn offset<N>(&self, ptr: *const N) -> usize {
-        let ptr_addr = ptr as usize;
-        let self_addr = self.ptr.get() as usize;
-        if ptr_addr > self_addr && ptr_addr < self_addr + self.cap.get() {
-            ptr_addr - self_addr
-        } else {
-            0
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_arena() {
-        // There is enough space
-        let arena = Arena::with_capacity(128);
-        let offset = arena.alloc(8);
-        assert_eq!(offset, 8);
-        assert_eq!(arena.len(), 16);
-        unsafe {
-            let ptr = arena.get_mut::<u64>(offset);
-            let offset = arena.offset::<u64>(ptr);
-            assert_eq!(offset, 8);
-        }
-
-        // There is not enough space, grow buf and then return the offset
-        let offset = arena.alloc(256);
-        assert_eq!(offset, 16);
+        ptr as usize
     }
 }
