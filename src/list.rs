@@ -118,21 +118,20 @@ impl Node {
     }
 }
 
-struct SkiplistInner<M: MemoryLimiter, C: KeyComparator> {
+struct SkiplistInner<M: MemoryLimiter> {
     height: AtomicUsize,
     head: NonNull<Node>,
     uppper_bound: RefCell<Option<Vec<u8>>>,
     end_node_offset: AtomicUsize,
     arena: Arena<M>,
-    c: C,
 }
 
-unsafe impl<M: MemoryLimiter, C: KeyComparator> Send for SkiplistInner<M, C> {}
-unsafe impl<M: MemoryLimiter, C: KeyComparator> Sync for SkiplistInner<M, C> {}
+unsafe impl<M: MemoryLimiter> Send for SkiplistInner<M> {}
+unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
 
 #[derive(Clone)]
 pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
-    inner: Arc<SkiplistInner<M, C>>,
+    inner: Arc<SkiplistInner<M>>,
     c: C,
 
     linked_skip_list: Arc<Mutex<Vec<Self>>>,
@@ -150,7 +149,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 uppper_bound: RefCell::new(None),
                 end_node_offset: AtomicUsize::new(0),
                 arena,
-                c: c.clone(),
             }),
             c,
             linked_skip_list: Arc::default(),
@@ -515,7 +513,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 uppper_bound: RefCell::new(Some(end.to_vec())),
                 end_node_offset: AtomicUsize::new(new_end_off),
                 arena: arena.clone(),
-                c: self.c.clone(),
             }),
             c: self.c.clone(),
             linked_skip_list: Arc::default(),
@@ -738,7 +735,7 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
     }
 }
 
-impl<M: MemoryLimiter, C: KeyComparator> Drop for SkiplistInner<M, C> {
+impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
         let mut node = self.head.as_ptr();
         loop {
