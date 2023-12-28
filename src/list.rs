@@ -9,7 +9,7 @@ use std::{
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     u32,
 };
@@ -134,6 +134,8 @@ unsafe impl<M: MemoryLimiter, C: KeyComparator> Sync for SkiplistInner<M, C> {}
 pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
     inner: Arc<SkiplistInner<M, C>>,
     c: C,
+
+    linked_skip_list: Arc<Mutex<Vec<Self>>>,
 }
 
 impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
@@ -151,6 +153,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 c: c.clone(),
             }),
             c,
+            linked_skip_list: Arc::default(),
         }
     }
 
@@ -505,7 +508,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             arena.offset(search.right[0])
         };
 
-        Skiplist {
+        let sl = Skiplist {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(self.height()),
                 head: new_head,
@@ -515,7 +518,10 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 c: self.c.clone(),
             }),
             c: self.c.clone(),
-        }
+            linked_skip_list: Arc::default(),
+        };
+        self.linked_skip_list.lock().unwrap().push(sl.clone());
+        sl
     }
 
     pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Option<(Bytes, Bytes)> {
