@@ -4,6 +4,7 @@ use std::{alloc::Layout, ptr};
 
 use crate::list::{MemoryLimiter, ReclaimableNode, U_SIZE};
 
+#[derive(Clone)]
 pub struct Arena<M: MemoryLimiter> {
     pub limiter: M,
 }

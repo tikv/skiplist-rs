@@ -2,6 +2,7 @@
 
 use core::slice::SlicePattern;
 use std::{
+    cell::RefCell,
     cmp, mem,
     ops::Deref,
     ptr,
@@ -117,22 +118,25 @@ impl Node {
     }
 }
 
-struct SkiplistInner<M: MemoryLimiter> {
+struct SkiplistInner<M: MemoryLimiter, C: KeyComparator> {
     height: AtomicUsize,
     head: NonNull<Node>,
+    uppper_bound: RefCell<Option<Vec<u8>>>,
+    end_node_offset: AtomicUsize,
     arena: Arena<M>,
-}
-
-unsafe impl<M: MemoryLimiter> Send for SkiplistInner<M> {}
-unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
-
-#[derive(Clone)]
-pub struct Skiplist<C: Clone, M: MemoryLimiter> {
-    inner: Arc<SkiplistInner<M>>,
     c: C,
 }
 
-impl<C: Clone, M: MemoryLimiter> Skiplist<C, M> {
+unsafe impl<M: MemoryLimiter, C: KeyComparator> Send for SkiplistInner<M, C> {}
+unsafe impl<M: MemoryLimiter, C: KeyComparator> Sync for SkiplistInner<M, C> {}
+
+#[derive(Clone)]
+pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
+    inner: Arc<SkiplistInner<M, C>>,
+    c: C,
+}
+
+impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     pub fn new(c: C, mem_limiter: M) -> Skiplist<C, M> {
         let arena = Arena::new(mem_limiter);
         let head_offset = Node::alloc(&arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
@@ -141,7 +145,10 @@ impl<C: Clone, M: MemoryLimiter> Skiplist<C, M> {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(0),
                 head,
+                uppper_bound: RefCell::new(None),
+                end_node_offset: AtomicUsize::new(0),
                 arena,
+                c: c.clone(),
             }),
             c,
         }
@@ -462,6 +469,55 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
+    /// Create a Skiplist with a header linking to the Node with key `key` in the current Skiplist
+    /// Note: **Must** ensure no concurrent `Modifications` is performed
+    pub fn link_to_key(&self, key: &[u8], end: &[u8]) -> Self {
+        let arena = &self.inner.arena;
+        let new_header_offset = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
+        let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_offset)) };
+
+        let mut replace = false;
+        if let Some(ref upper_bound) = *self.inner.uppper_bound.borrow() {
+            if self.c.compare_key(upper_bound, key).is_gt() {
+                replace = true;
+            }
+        } else {
+            replace = true;
+        }
+
+        let new_end_off = unsafe {
+            let search = self.search_position(key);
+            for i in 0..search.right.len() {
+                let right = search.right[i];
+                if i == 0 && replace {
+                    println!("linking {:?}", (*right).key);
+                    self.inner
+                        .end_node_offset
+                        .store(arena.offset(right), Ordering::Relaxed);
+                }
+                if right.is_null() {
+                    break;
+                }
+                new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
+            }
+
+            let search = self.search_position(end);
+            arena.offset(search.right[0])
+        };
+
+        Skiplist {
+            inner: Arc::new(SkiplistInner {
+                height: AtomicUsize::new(self.height()),
+                head: new_head,
+                uppper_bound: RefCell::new(Some(end.to_vec())),
+                end_node_offset: AtomicUsize::new(new_end_off),
+                arena: arena.clone(),
+                c: self.c.clone(),
+            }),
+            c: self.c.clone(),
+        }
+    }
+
     pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Option<(Bytes, Bytes)> {
         let (key, value) = (key.into(), value.into());
         let mut list_height = self.height();
@@ -670,33 +726,45 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     }
 }
 
-impl<C: Clone, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M> {
+impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M> {
     fn as_ref(&self) -> &Skiplist<C, M> {
         self
     }
 }
 
-impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
+impl<M: MemoryLimiter, C: KeyComparator> Drop for SkiplistInner<M, C> {
     fn drop(&mut self) {
         let mut node = self.head.as_ptr();
         loop {
             let next = unsafe { (*node).next_offset(0) };
             if next != 0 {
-                let next_ptr = unsafe { self.arena.get_mut(next) };
+                let (next_ptr, end_off) = unsafe {
+                    let next_ptr: *mut Node = self.arena.get_mut(next);
+                    let end_off = self.end_node_offset.load(Ordering::Relaxed);
+                    (next_ptr, end_off)
+                };
                 unsafe {
+                    println!("{:?} is dropped", (*node).key);
                     ptr::drop_in_place(node);
                 }
+                if next_ptr as usize == end_off {
+                    return;
+                }
+
                 node = next_ptr;
                 continue;
             }
-            unsafe { ptr::drop_in_place(node) };
+            unsafe {
+                println!("{:?} is dropped", (*node).key);
+                ptr::drop_in_place(node)
+            };
             return;
         }
     }
 }
 
-unsafe impl<C: Send + Clone, M: MemoryLimiter> Send for Skiplist<C, M> {}
-unsafe impl<C: Sync + Clone, M: MemoryLimiter> Sync for Skiplist<C, M> {}
+unsafe impl<C: Send + KeyComparator, M: MemoryLimiter> Send for Skiplist<C, M> {}
+unsafe impl<C: Sync + KeyComparator, M: MemoryLimiter> Sync for Skiplist<C, M> {}
 
 pub struct NodeWrap(*const Node);
 unsafe impl Send for NodeWrap {}
@@ -709,7 +777,7 @@ impl Deref for NodeWrap {
     }
 }
 
-pub struct IterRef<T, C: Clone, M: MemoryLimiter>
+pub struct IterRef<T, C: KeyComparator, M: MemoryLimiter>
 where
     T: AsRef<Skiplist<C, M>>,
 {
@@ -843,8 +911,6 @@ fn below_upper_bound<C: KeyComparator>(
 
 #[cfg(test)]
 mod tests {
-    use std::{alloc::Layout, collections::HashSet};
-
     use super::*;
     use crate::{fetch_stats, key::ByteWiseComparator, FixedLengthSuffixComparator, ReadableSize};
 
@@ -1117,29 +1183,6 @@ mod tests {
             i += 1;
         }
 
-        // let mut removed = vec![];
-        // let mut iter = sklist.iter();
-        // iter.seek_to_first();
-        // let mut i = 0;
-        // while iter.valid() {
-        //     let key = iter.key();
-        //     let a = sklist.remove(key.as_slice());
-        //     removed.push(a);
-        //     iter.next();
-
-        //     if i % 100000 == 0 {
-        //         std::thread::sleep(Duration::from_millis(500));
-        //         println!("remove progress: {}", i);
-        //     }
-        //     i += 1;
-        // }
-
-        // std::thread::sleep(Duration::from_secs(5));
-
-        // for m in removed {
-        //     println!("{:?}", m);
-        // }
-
         let mut iter = sklist.iter();
         iter.seek_to_first();
         let mut count = 0;
@@ -1148,33 +1191,6 @@ mod tests {
             iter.next();
         }
         assert!(count == 0);
-    }
-
-    #[test]
-    fn test_x() {
-        let mut rng = rand::thread_rng();
-        let mut s: HashSet<usize> = HashSet::default();
-        for i in 0..100000000 {
-            let n: usize = rng.gen();
-            let layout = Layout::from_size_align(n % 10001 + 100, 8).unwrap();
-            let addr = unsafe { std::alloc::alloc(layout.clone()) };
-            // println!("{:?}", addr);
-            s.insert(addr as usize);
-            unsafe {
-                std::alloc::dealloc(addr, layout);
-            }
-
-            if i % 500000 == 0 {
-                println!("progress: {}", i);
-
-                let stats = fetch_stats().unwrap().unwrap();
-                for (name, n) in stats {
-                    println!("{:?}, {} mb", name, ReadableSize(n as u64).as_mb());
-                }
-
-                println!("total {}", s.len());
-            }
-        }
     }
 
     #[test]
@@ -1214,6 +1230,33 @@ mod tests {
             let key = iter.key();
             let value = iter.value();
             println!("{:?}, {:?}", key, value);
+            iter.next();
+        }
+    }
+
+    #[test]
+    fn test_link_to_key() {
+        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        for i in 0..30 {
+            let key = Bytes::from(format!("key{:03}", i));
+            let value = Bytes::from(format!("value{:03}", i));
+            sklist.put(key, value);
+        }
+
+        let key = format!("key{:03}", 20);
+        let end = Bytes::from(format!("key{:03}", 30));
+        let _ = sklist.link_to_key(key.as_bytes(), &end);
+
+        let key = format!("key{:03}", 10);
+        let end = Bytes::from(format!("key{:03}", 20));
+        let sklist3 = sklist.link_to_key(key.as_bytes(), &end);
+
+        let mut iter = sklist3.iter();
+        iter.seek_to_first();
+        while iter.valid() {
+            let k = iter.key();
+            let v = iter.value();
+            println!("{:?} {:?}", k, v);
             iter.next();
         }
     }
