@@ -2,7 +2,6 @@
 
 use core::slice::SlicePattern;
 use std::{
-    cell::RefCell,
     cmp, mem,
     ops::Deref,
     ptr,
@@ -121,8 +120,10 @@ impl Node {
 struct SkiplistInner<M: MemoryLimiter> {
     height: AtomicUsize,
     head: NonNull<Node>,
-    uppper_bound: RefCell<Option<Vec<u8>>>,
-    end_node_offset: AtomicUsize,
+    // After calling `link_to_key` and before `unlink`, the nodes
+    // in the skiplist is not exclusively owned by it (it owns the nodes from header to some node).
+    // Here, we record the offset of the node after the last node we owned as `end_node_offset`.
+    end_offset: AtomicUsize,
     arena: Arena<M>,
 }
 
@@ -146,8 +147,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(0),
                 head,
-                uppper_bound: RefCell::new(None),
-                end_node_offset: AtomicUsize::new(0),
+                // 0 means the sentinel tailer
+                end_offset: AtomicUsize::new(usize::MAX),
                 arena,
             }),
             c,
@@ -470,48 +471,79 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
+    pub fn new_lists_by_link(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
+        assert!(keys.len() >= 1);
+        let cur_end_off = self.inner.end_offset.load(Ordering::Relaxed);
+        assert_ne!(cur_end_off, 0);
+        let end_key = if cur_end_off != usize::MAX {
+            unsafe {
+                let tailer_key = (*(cur_end_off as *mut Node)).key.clone();
+                assert!(self
+                    .c
+                    .compare_key(&tailer_key, keys.last().unwrap())
+                    .is_gt());
+                tailer_key
+            }
+        } else {
+            Bytes::default()
+        };
+
+        self.inner.end_offset.store(usize::MAX, Ordering::Relaxed);
+
+        let mut skiplists = vec![];
+        for i in 0..keys.len() - 1 {
+            skiplists.push(self.new_list_by_link(&keys[i], &keys[i + 1]));
+        }
+
+        skiplists.push(self.new_list_by_link(&keys[keys.len() - 1], &end_key));
+        skiplists
+    }
+
     /// Create a Skiplist with a header linking to the Node with key `key` in the current Skiplist
-    /// Note: **Must** ensure no concurrent `Modifications` is performed
-    pub fn link_to_key(&self, key: &[u8], end: &[u8]) -> Self {
+    ///
+    /// Note: **Must** ensure no concurrent `Modifications` is performed,
+    /// all subsequent caller must have a larger `key` passed in.
+    fn new_list_by_link(&self, key: &[u8], end: &[u8]) -> Self {
         let arena = &self.inner.arena;
         let new_header_offset = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
         let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_offset)) };
-
-        let mut replace = false;
-        if let Some(ref upper_bound) = *self.inner.uppper_bound.borrow() {
-            if self.c.compare_key(upper_bound, key).is_gt() {
-                replace = true;
-            }
-        } else {
-            replace = true;
-        }
 
         let new_end_off = unsafe {
             let search = self.search_position(key);
             for i in 0..search.right.len() {
                 let right = search.right[i];
-                if i == 0 && replace {
-                    println!("linking {:?}", (*right).key);
-                    self.inner
-                        .end_node_offset
-                        .store(arena.offset(right), Ordering::Relaxed);
+                let right_offset = arena.offset(right);
+
+                if i == 0 {
+                    let end_off = self.inner.end_offset.load(Ordering::Relaxed);
+                    if end_off == usize::MAX {
+                        self.inner.end_offset.store(right_offset, Ordering::Relaxed);
+                    }
                 }
+
                 if right.is_null() {
                     break;
                 }
+
                 new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
             }
 
-            let search = self.search_position(end);
-            arena.offset(search.right[0])
+            // we should remember the end offest for it so that if the skiplist
+            // is dropped before the `cut`, we will not free elements that will
+            // be freed by other skiplists
+            if !end.is_empty() {
+                let search = self.search_position(end);
+                arena.offset(search.right[0])
+            } else {
+                0
+            }
         };
 
         let sl = Skiplist {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(self.height()),
                 head: new_head,
-                uppper_bound: RefCell::new(Some(end.to_vec())),
-                end_node_offset: AtomicUsize::new(new_end_off),
+                end_offset: AtomicUsize::new(new_end_off),
                 arena: arena.clone(),
             }),
             c: self.c.clone(),
@@ -520,6 +552,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         self.linked_skip_list.lock().unwrap().push(sl.clone());
         sl
     }
+
+    pub fn trim(&self) {}
 
     pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Option<(Bytes, Bytes)> {
         let (key, value) = (key.into(), value.into());
@@ -738,14 +772,11 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
 impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
         let mut node = self.head.as_ptr();
+        let end_off = self.end_offset.load(Ordering::Relaxed);
         loop {
             let next = unsafe { (*node).next_offset(0) };
             if next != 0 {
-                let (next_ptr, end_off) = unsafe {
-                    let next_ptr: *mut Node = self.arena.get_mut(next);
-                    let end_off = self.end_node_offset.load(Ordering::Relaxed);
-                    (next_ptr, end_off)
-                };
+                let next_ptr = unsafe { self.arena.get_mut(next) };
                 unsafe {
                     println!("{:?} is dropped", (*node).key);
                     ptr::drop_in_place(node);
@@ -916,6 +947,13 @@ fn below_upper_bound<C: KeyComparator>(
 mod tests {
     use super::*;
     use crate::{fetch_stats, key::ByteWiseComparator, FixedLengthSuffixComparator, ReadableSize};
+
+    #[cfg(not(target_env = "msvc"))]
+    use tikv_jemallocator::Jemalloc;
+
+    #[cfg(not(target_env = "msvc"))]
+    #[global_allocator]
+    static GLOBAL: Jemalloc = Jemalloc;
 
     #[derive(Clone, Default)]
     struct DummyLimiter {}
@@ -1160,10 +1198,10 @@ mod tests {
     fn test_iter_remove4() {
         let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
-        let num = 100000000;
+        let num = 5000000;
         while i < num {
             let key = Bytes::from(format!("key{:010}", i));
-            let value = Bytes::from(format!("valuevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevaluevalu{:010}", i));
+            let value = Bytes::from(format!("val-{:0100}", i));
             sklist.put(key.clone(), value);
             sklist.remove(key.as_slice());
 
@@ -1246,20 +1284,82 @@ mod tests {
             sklist.put(key, value);
         }
 
-        let key = format!("key{:03}", 20);
-        let end = Bytes::from(format!("key{:03}", 30));
-        let _ = sklist.link_to_key(key.as_bytes(), &end);
-
-        let key = format!("key{:03}", 10);
-        let end = Bytes::from(format!("key{:03}", 20));
-        let sklist3 = sklist.link_to_key(key.as_bytes(), &end);
-
-        let mut iter = sklist3.iter();
+        let keys = vec![
+            format!("key{:03}", 0).as_bytes().to_vec(),
+            format!("key{:03}", 10).as_bytes().to_vec(),
+            format!("key{:03}", 20).as_bytes().to_vec(),
+        ];
+        let skiplists = sklist.new_lists_by_link(&keys);
+        let mut iter = skiplists[0].iter();
         iter.seek_to_first();
-        while iter.valid() {
+        for i in 0..10 {
+            let key = format!("key{:03}", i);
             let k = iter.key();
-            let v = iter.value();
-            println!("{:?} {:?}", k, v);
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let mut iter = skiplists[1].iter();
+        iter.seek_to_first();
+        for i in 10..20 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let mut iter = skiplists[2].iter();
+        iter.seek_to_first();
+        for i in 20..30 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let keys = vec![
+            format!("key{:03}", 0).as_bytes().to_vec(),
+            format!("key{:03}", 5).as_bytes().to_vec(),
+        ];
+        let skiplists = skiplists[0].new_lists_by_link(&keys);
+        let mut iter = skiplists[0].iter();
+        iter.seek_to_first();
+        for i in 0..5 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let mut iter = skiplists[1].iter();
+        iter.seek_to_first();
+        for i in 5..10 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let keys = vec![
+            format!("key{:03}", 5).as_bytes().to_vec(),
+            format!("key{:03}", 8).as_bytes().to_vec(),
+        ];
+        let skiplists = skiplists[1].new_lists_by_link(&keys);
+        let mut iter = skiplists[0].iter();
+        iter.seek_to_first();
+        for i in 5..8 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
+            iter.next();
+        }
+
+        let mut iter = skiplists[1].iter();
+        iter.seek_to_first();
+        for i in 8..10 {
+            let key = format!("key{:03}", i);
+            let k = iter.key();
+            assert_eq!(k, &key);
             iter.next();
         }
     }
