@@ -561,8 +561,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         sl
     }
 
-    pub fn trim(&self) {}
-
     pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> Option<(Bytes, Bytes)> {
         let (key, value) = (key.into(), value.into());
         let mut list_height = self.height();
@@ -786,7 +784,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
                 unsafe {
-                    // println!("{:?} is dropped", (*node).key);
+                    println!("{:?} is dropped", (*node).key);
                     ptr::drop_in_place(node);
                 }
                 if next_ptr as usize == end_off {
@@ -797,7 +795,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
                 continue;
             }
             unsafe {
-                // println!("{:?} is dropped", (*node).key);
+                println!("{:?} is dropped", (*node).key);
                 ptr::drop_in_place(node)
             };
             return;
