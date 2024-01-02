@@ -8,7 +8,7 @@ use std::{
     ptr::NonNull,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     u32,
 };
@@ -134,8 +134,6 @@ unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
 pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
     inner: Arc<SkiplistInner<M>>,
     c: C,
-
-    linked_skip_list: Arc<Mutex<Vec<Self>>>,
 }
 
 impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
@@ -152,7 +150,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 arena,
             }),
             c,
-            linked_skip_list: Arc::default(),
         }
     }
 
@@ -471,7 +468,20 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    pub fn new_lists_by_link(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
+    // Split the skiplist by using new headers linking to the target start Node.
+    // Say we have a list:
+    //              n1 -> 1 -> 2 -> 3 -> tailer
+    //              and split keys are 1, 2, and 3
+    // After split, the skiplist becomes:
+    //              n1 -> 1 -> 2 -> 3 -> tailer
+    //                    ^    ^    ^
+    //                    |    |    |
+    //                   n2   n3    n4
+    // The tailers of n1, n2, n3, and n4 are 0, offset of 2, offset of 3, and tailer respectively.
+    // The tailer is used to guide the drop process so that n1..n4 will not dropp the same elements.
+    // **Note**: upper caller should restrict the boundaries of the read as the skiplists is able
+    // to read elements that is not belong to it and even worse, the element is dropped.
+    pub fn split_skiplist(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
         assert!(keys.len() >= 1);
         let cur_end_off = self.inner.end_offset.load(Ordering::Relaxed);
         assert_ne!(cur_end_off, 0);
@@ -547,9 +557,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 arena: arena.clone(),
             }),
             c: self.c.clone(),
-            linked_skip_list: Arc::default(),
         };
-        self.linked_skip_list.lock().unwrap().push(sl.clone());
         sl
     }
 
@@ -778,7 +786,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
                 unsafe {
-                    println!("{:?} is dropped", (*node).key);
+                    // println!("{:?} is dropped", (*node).key);
                     ptr::drop_in_place(node);
                 }
                 if next_ptr as usize == end_off {
@@ -789,7 +797,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
                 continue;
             }
             unsafe {
-                println!("{:?} is dropped", (*node).key);
+                // println!("{:?} is dropped", (*node).key);
                 ptr::drop_in_place(node)
             };
             return;
@@ -1289,7 +1297,7 @@ mod tests {
             format!("key{:03}", 10).as_bytes().to_vec(),
             format!("key{:03}", 20).as_bytes().to_vec(),
         ];
-        let skiplists = sklist.new_lists_by_link(&keys);
+        let skiplists = sklist.split_skiplist(&keys);
         let mut iter = skiplists[0].iter();
         iter.seek_to_first();
         for i in 0..10 {
@@ -1321,7 +1329,7 @@ mod tests {
             format!("key{:03}", 0).as_bytes().to_vec(),
             format!("key{:03}", 5).as_bytes().to_vec(),
         ];
-        let skiplists = skiplists[0].new_lists_by_link(&keys);
+        let skiplists = skiplists[0].split_skiplist(&keys);
         let mut iter = skiplists[0].iter();
         iter.seek_to_first();
         for i in 0..5 {
@@ -1344,7 +1352,7 @@ mod tests {
             format!("key{:03}", 5).as_bytes().to_vec(),
             format!("key{:03}", 8).as_bytes().to_vec(),
         ];
-        let skiplists = skiplists[1].new_lists_by_link(&keys);
+        let skiplists = skiplists[1].split_skiplist(&keys);
         let mut iter = skiplists[0].iter();
         iter.seek_to_first();
         for i in 5..8 {
