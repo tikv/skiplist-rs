@@ -57,6 +57,10 @@ impl<M: MemoryLimiter> Arena<M> {
     }
 
     pub fn offset<N>(&self, ptr: *const N) -> usize {
-        ptr as usize
+        if ptr.is_null() {
+            0
+        } else {
+            ptr as usize
+        }
     }
 }

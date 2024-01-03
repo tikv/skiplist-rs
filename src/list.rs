@@ -83,8 +83,9 @@ pub trait MemoryLimiter: Clone {
 impl Node {
     fn alloc<M: MemoryLimiter>(arena: &Arena<M>, key: Bytes, value: Bytes, height: usize) -> usize {
         // Not all values in Node::tower will be utilized.
-        let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
-        let node_offset = arena.alloc(NODE_SIZE - not_used);
+        // let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
+        // let node_offset = arena.alloc(NODE_SIZE - not_used);
+        let node_offset = arena.alloc(NODE_SIZE);
         unsafe {
             let node_ptr: *mut Node = arena.get_mut(node_offset);
             let node = &mut *node_ptr;
@@ -165,6 +166,23 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
     fn height(&self) -> usize {
         self.inner.height.load(Ordering::SeqCst)
+    }
+
+    fn print(&self) {
+        println!("print the skiplist");
+        unsafe {
+            for i in (0..self.height()).rev() {
+                let mut node_off = self.inner.head.as_ref().tower[i].load(Ordering::Relaxed);
+
+                print!("level {}", i);
+                while node_off != 0 {
+                    let node: *mut Node = self.inner.arena.get_mut(node_off);
+                    print!("  {:?} -->", (*node).key);
+                    node_off = (*node).tower[i].load(Ordering::Relaxed);
+                }
+                println!()
+            }
+        }
     }
 }
 
@@ -513,54 +531,111 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     ///
     /// Note: **Must** ensure no concurrent `Modifications` is performed,
     /// all subsequent caller must have a larger `key` passed in.
-    fn new_list_by_link(&self, key: &[u8], end: &[u8]) -> Self {
+    fn new_list_by_link(&self, start: &[u8], end: &[u8]) -> Self {
         let arena = &self.inner.arena;
         let new_header_offset = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
         let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_offset)) };
 
-        let new_end_off = unsafe {
-            let search = self.search_position(key);
-            for i in 0..search.right.len() {
-                let right = search.right[i];
-                let right_offset = arena.offset(right);
+        unsafe {
+            let search = self.search_position(start);
+            let start_right = search.right[0];
+            let start_right_offset = arena.offset(start_right);
+            if self.inner.end_offset.load(Ordering::Relaxed) == usize::MAX {
+                self.inner
+                    .end_offset
+                    .store(start_right_offset, Ordering::Relaxed);
+            }
+            new_head.as_ref().tower[0].store(start_right_offset, Ordering::Relaxed);
 
-                if i == 0 {
-                    let end_off = self.inner.end_offset.load(Ordering::Relaxed);
-                    if end_off == usize::MAX {
-                        self.inner.end_offset.store(right_offset, Ordering::Relaxed);
-                    }
-                }
-
-                if right.is_null() {
+            for i in 1..search.right.len() {
+                if search.right[i].is_null() {
                     break;
                 }
 
-                if i == 0 {
-                    println!("next to head {:?}", (*right).key);
-                }
-                new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
+                new_head.as_ref().tower[i].store(arena.offset(search.right[i]), Ordering::SeqCst);
             }
 
-            // we should remember the end offest for it so that if the skiplist
-            // is dropped before the `cut`, we will not free elements that will
-            // be freed by other skiplists
-            if !end.is_empty() {
-                let search = self.search_position(end);
-                arena.offset(search.right[0])
-            } else {
-                usize::MAX
-            }
+            // for i in 0..search.right.len() {
+            //     let right = search.right[i];
+            //     let right_offset = arena.offset(right);
+
+            //     if i == 0 {
+            //         let end_off = self.inner.end_offset.load(Ordering::Relaxed);
+            //         if end_off == usize::MAX {
+            //             self.inner.end_offset.store(right_offset, Ordering::Relaxed);
+            //         }
+            //     }
+
+            //     if right.is_null() {
+            //         break;
+            //     }
+
+            //     if i == 0 {
+            //         println!("next to head {:?}", (*right).key);
+            //     }
+            //     new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
+            // }
+
+            // // we should remember the end offest for it so that if the skiplist
+            // // is dropped before the `cut`, we will not free elements that will
+            // // be freed by other skiplists
+            // if !end.is_empty() {
+            //     let search = self.search_position(end);
+            //     let end_right = search.right[0];
+            //     let end_right_offset = arena.offset(end_right);
+
+            //     // for i in 1..search.right.len() {
+            //     //     if search.right[i].is_null() {
+            //     //         break;
+            //     //     }
+
+            //     //     (*search.left[i]).tower[i].store(end_right_offset, Ordering::Relaxed);
+            //     // }
+
+            //     let search = self.search_position(end);
+            //     end_right_offset
+            // } else {
+            //     usize::MAX
+            // }
         };
 
         let sl = Skiplist {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(self.height()),
                 head: new_head,
-                end_offset: AtomicUsize::new(new_end_off),
+                end_offset: AtomicUsize::new(usize::MAX),
                 arena: arena.clone(),
             }),
             c: self.c.clone(),
         };
+
+        if !end.is_empty() {
+            unsafe {
+                let search = sl.search_position(end);
+                let end_right = search.right[0];
+                let end_right_offset = arena.offset(end_right);
+
+                for i in 1..search.right.len() {
+                    let right_node = search.right[i];
+                    if right_node.is_null() {
+                        break;
+                    }
+                    let right_off = arena.offset(right_node);
+                    let left_node = search.left[i];
+                    if (*left_node).tower[i].load(Ordering::Relaxed) != end_right_offset {
+                        assert!((*end_right).height < i);
+                        (*end_right).tower[i].store(right_off, Ordering::SeqCst);
+                        (*left_node).tower[i].store(end_right_offset, Ordering::SeqCst);
+                        (*end_right).height = i;
+                    }
+                }
+
+                sl.inner
+                    .end_offset
+                    .store(end_right_offset, Ordering::Relaxed);
+            }
+        }
+
         sl
     }
 
