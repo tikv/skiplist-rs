@@ -168,7 +168,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         self.inner.height.load(Ordering::SeqCst)
     }
 
-    fn print(&self) {
+    pub fn print(&self) {
         println!("print the skiplist");
         unsafe {
             for i in (0..self.height()).rev() {
