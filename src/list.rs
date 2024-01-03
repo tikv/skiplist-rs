@@ -875,7 +875,6 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
 
 impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
-        self.print();
         let mut node = self.head.as_ptr();
         let end_off = self.freeable_end_offset.load(Ordering::Relaxed);
         loop {
