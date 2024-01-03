@@ -128,6 +128,25 @@ struct SkiplistInner<M: MemoryLimiter> {
     arena: Arena<M>,
 }
 
+impl<M: MemoryLimiter> SkiplistInner<M> {
+    pub fn print(&self) {
+        println!("print the skiplist");
+        unsafe {
+            for i in (0..self.height.load(Ordering::Relaxed)).rev() {
+                let mut node_off = self.head.as_ref().tower[i].load(Ordering::Relaxed);
+
+                print!("level {}", i);
+                while node_off != 0 {
+                    let node: *mut Node = self.arena.get_mut(node_off);
+                    print!("  {:?} -->", (*node).key);
+                    node_off = (*node).tower[i].load(Ordering::Relaxed);
+                }
+                println!()
+            }
+        }
+    }
+}
+
 unsafe impl<M: MemoryLimiter> Send for SkiplistInner<M> {}
 unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
 
@@ -169,20 +188,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     }
 
     pub fn print(&self) {
-        println!("print the skiplist");
-        unsafe {
-            for i in (0..self.height()).rev() {
-                let mut node_off = self.inner.head.as_ref().tower[i].load(Ordering::Relaxed);
-
-                print!("level {}", i);
-                while node_off != 0 {
-                    let node: *mut Node = self.inner.arena.get_mut(node_off);
-                    print!("  {:?} -->", (*node).key);
-                    node_off = (*node).tower[i].load(Ordering::Relaxed);
-                }
-                println!()
-            }
-        }
+        self.inner.print()
     }
 }
 
@@ -855,6 +861,7 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
 
 impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
+        self.print();
         let mut node = self.head.as_ptr();
         let end_off = self.end_offset.load(Ordering::Relaxed);
         loop {
