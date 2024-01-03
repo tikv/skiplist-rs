@@ -124,7 +124,9 @@ struct SkiplistInner<M: MemoryLimiter> {
     // After calling `link_to_key` and before `unlink`, the nodes
     // in the skiplist is not exclusively owned by it (it owns the nodes from header to some node).
     // Here, we record the offset of the node after the last node we owned as `end_node_offset`.
-    end_offset: AtomicUsize,
+    freeable_end_offset: AtomicUsize,
+    // readable_end_offset is used to know where is the end. Without it, we may read Node that has been dropped.
+    readable_end_offset: AtomicUsize,
     arena: Arena<M>,
 }
 
@@ -136,7 +138,8 @@ impl<M: MemoryLimiter> SkiplistInner<M> {
                 let mut node_off = self.head.as_ref().tower[i].load(Ordering::Relaxed);
 
                 print!("level {}", i);
-                while node_off != 0 {
+                while node_off != 0 && node_off != self.readable_end_offset.load(Ordering::Relaxed)
+                {
                     let node: *mut Node = self.arena.get_mut(node_off);
                     print!("  {:?} -->", (*node).key);
                     node_off = (*node).tower[i].load(Ordering::Relaxed);
@@ -166,7 +169,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 height: AtomicUsize::new(0),
                 head,
                 // 0 means the sentinel tailer
-                end_offset: AtomicUsize::new(usize::MAX),
+                freeable_end_offset: AtomicUsize::new(usize::MAX),
+                readable_end_offset: AtomicUsize::new(usize::MAX),
                 arena,
             }),
             c,
@@ -410,7 +414,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     // Iterate through the current level until we reach a node with a key greater
                     // than or equal to `key`.
                     let mut curr_node: *mut Node = self.inner.arena.get_mut(curr);
-                    while !curr_node.is_null() {
+                    while !curr_node.is_null()
+                        && curr != self.inner.readable_end_offset.load(Ordering::Relaxed)
+                    {
                         let succ = (*curr_node).next_offset(level);
 
                         if tag(succ) == 1 {
@@ -507,7 +513,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     // to read elements that is not belong to it and even worse, the element is dropped.
     pub fn split_skiplist(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
         assert!(keys.len() >= 1);
-        let cur_end_off = self.inner.end_offset.load(Ordering::Relaxed);
+        let cur_end_off = self.inner.freeable_end_offset.load(Ordering::Relaxed);
         assert_ne!(cur_end_off, 0);
         let end_key = if cur_end_off != usize::MAX {
             unsafe {
@@ -522,7 +528,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             Bytes::default()
         };
 
-        self.inner.end_offset.store(usize::MAX, Ordering::Relaxed);
+        self.inner
+            .freeable_end_offset
+            .store(usize::MAX, Ordering::Relaxed);
 
         let mut skiplists = vec![];
         for i in 0..keys.len() - 1 {
@@ -546,9 +554,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             let search = self.search_position(start);
             let start_right = search.right[0];
             let start_right_offset = arena.offset(start_right);
-            if self.inner.end_offset.load(Ordering::Relaxed) == usize::MAX {
+            if self.inner.freeable_end_offset.load(Ordering::Relaxed) == usize::MAX {
                 self.inner
-                    .end_offset
+                    .freeable_end_offset
                     .store(start_right_offset, Ordering::Relaxed);
             }
             new_head.as_ref().tower[0].store(start_right_offset, Ordering::Relaxed);
@@ -609,7 +617,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(self.height()),
                 head: new_head,
-                end_offset: AtomicUsize::new(usize::MAX),
+                freeable_end_offset: AtomicUsize::new(usize::MAX),
+                readable_end_offset: AtomicUsize::new(usize::MAX),
                 arena: arena.clone(),
             }),
             c: self.c.clone(),
@@ -637,7 +646,10 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
 
                 sl.inner
-                    .end_offset
+                    .freeable_end_offset
+                    .store(end_right_offset, Ordering::Relaxed);
+                sl.inner
+                    .readable_end_offset
                     .store(end_right_offset, Ordering::Relaxed);
             }
         }
@@ -863,7 +875,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
         self.print();
         let mut node = self.head.as_ptr();
-        let end_off = self.end_offset.load(Ordering::Relaxed);
+        let end_off = self.freeable_end_offset.load(Ordering::Relaxed);
         loop {
             let next = unsafe { (*node).next_offset(0) };
             if next != 0 {
