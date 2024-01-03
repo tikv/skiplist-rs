@@ -535,9 +535,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     break;
                 }
 
-                if i == 0 {
-                    println!("next to head {:?}", (*right).key);
-                }
                 new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
             }
 
