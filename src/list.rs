@@ -548,7 +548,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 let search = self.search_position(end);
                 arena.offset(search.right[0])
             } else {
-                u64::MAX
+                usize::MAX
             }
         };
 
