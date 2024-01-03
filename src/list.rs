@@ -342,7 +342,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 // Iterate through the current level until we reach a node with a key greater
                 // than or equal to `key`.
                 let mut curr_node: *mut Node = self.inner.arena.get_mut(curr);
-                while !curr_node.is_null() {
+                while !curr_node.is_null()
+                    && curr != self.inner.readable_end_offset.load(Ordering::Relaxed)
+                {
                     let succ = (*curr_node).next_offset(level);
 
                     if tag(succ) == 1 {
