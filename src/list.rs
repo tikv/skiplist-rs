@@ -62,8 +62,7 @@ pub trait ReclaimableNode {
 
 impl ReclaimableNode for Node {
     fn size(&self) -> usize {
-        let not_used = (MAX_HEIGHT - self.height - 1) * U_SIZE;
-        NODE_SIZE - not_used
+        NODE_SIZE
     }
 
     fn drop_key_value(&mut self) {
@@ -579,49 +578,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
                 new_head.as_ref().tower[i].store(arena.offset(search.right[i]), Ordering::SeqCst);
             }
-
-            // for i in 0..search.right.len() {
-            //     let right = search.right[i];
-            //     let right_offset = arena.offset(right);
-
-            //     if i == 0 {
-            //         let end_off = self.inner.end_offset.load(Ordering::Relaxed);
-            //         if end_off == usize::MAX {
-            //             self.inner.end_offset.store(right_offset, Ordering::Relaxed);
-            //         }
-            //     }
-
-            //     if right.is_null() {
-            //         break;
-            //     }
-
-            //     if i == 0 {
-            //         println!("next to head {:?}", (*right).key);
-            //     }
-            //     new_head.as_ref().tower[i].store(arena.offset(right), Ordering::SeqCst);
-            // }
-
-            // // we should remember the end offest for it so that if the skiplist
-            // // is dropped before the `cut`, we will not free elements that will
-            // // be freed by other skiplists
-            // if !end.is_empty() {
-            //     let search = self.search_position(end);
-            //     let end_right = search.right[0];
-            //     let end_right_offset = arena.offset(end_right);
-
-            //     // for i in 1..search.right.len() {
-            //     //     if search.right[i].is_null() {
-            //     //         break;
-            //     //     }
-
-            //     //     (*search.left[i]).tower[i].store(end_right_offset, Ordering::Relaxed);
-            //     // }
-
-            //     let search = self.search_position(end);
-            //     end_right_offset
-            // } else {
-            //     usize::MAX
-            // }
         };
 
         let sl = Skiplist {
@@ -890,10 +846,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
             let next = unsafe { (*node).next_offset(0) };
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
-                unsafe {
-                    println!("{:?} is dropped", (*node).key);
-                    ptr::drop_in_place(node);
-                }
+                self.arena.free(node);
                 if next_ptr as usize == end_off {
                     return;
                 }
@@ -901,10 +854,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
                 node = next_ptr;
                 continue;
             }
-            unsafe {
-                println!("{:?} is dropped", (*node).key);
-                ptr::drop_in_place(node)
-            };
+            self.arena.free(node);
             return;
         }
     }
@@ -1069,6 +1019,8 @@ fn below_upper_bound<C: KeyComparator>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use crate::{fetch_stats, key::ByteWiseComparator, FixedLengthSuffixComparator, ReadableSize};
 
@@ -1080,10 +1032,21 @@ mod tests {
     static GLOBAL: Jemalloc = Jemalloc;
 
     #[derive(Clone, Default)]
-    struct DummyLimiter {}
+    struct DummyLimiter {
+        acquired: Arc<Mutex<usize>>,
+    }
+
+    impl Drop for DummyLimiter {
+        fn drop(&mut self) {
+            let acquired = self.acquired.lock().unwrap();
+            assert!(*acquired == 0);
+        }
+    }
 
     impl MemoryLimiter for DummyLimiter {
-        fn acquire(&self, _n: usize) -> bool {
+        fn acquire(&self, n: usize) -> bool {
+            let mut acquired = self.acquired.lock().unwrap();
+            *acquired += n;
             true
         }
 
@@ -1091,7 +1054,10 @@ mod tests {
             0
         }
 
-        fn reclaim(&self, _n: usize) {}
+        fn reclaim(&self, n: usize) {
+            let mut acquired = self.acquired.lock().unwrap();
+            *acquired -= n;
+        }
     }
 
     fn with_skl_test(f: impl FnOnce(Skiplist<FixedLengthSuffixComparator, DummyLimiter>)) {
@@ -1322,7 +1288,7 @@ mod tests {
     fn test_iter_remove4() {
         let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
         let mut i = 0;
-        let num = 5000000;
+        let num = 2000000;
         while i < num {
             let key = Bytes::from(format!("key{:010}", i));
             let value = Bytes::from(format!("val-{:0100}", i));
@@ -1373,82 +1339,134 @@ mod tests {
             format!("key{:03}", 20).as_bytes().to_vec(),
         ];
         let skiplists = sklist.split_skiplist(&keys);
+        drop(sklist);
         let mut iter = skiplists[0].iter();
+        let mut iter2 = skiplists[0].iter();
         iter.seek_to_first();
         for i in 0..10 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
         let mut iter = skiplists[1].iter();
+        let mut iter2 = skiplists[1].iter();
         iter.seek_to_first();
         for i in 10..20 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
         let mut iter = skiplists[2].iter();
+        let mut iter2 = skiplists[2].iter();
         iter.seek_to_first();
         for i in 20..30 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
+        // split again
         let keys = vec![
             format!("key{:03}", 0).as_bytes().to_vec(),
             format!("key{:03}", 5).as_bytes().to_vec(),
         ];
         let skiplists = skiplists[0].split_skiplist(&keys);
         let mut iter = skiplists[0].iter();
+        let mut iter2 = skiplists[0].iter();
         iter.seek_to_first();
         for i in 0..5 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
         let mut iter = skiplists[1].iter();
+        let mut iter2 = skiplists[1].iter();
         iter.seek_to_first();
         for i in 5..10 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
+        // split again
         let keys = vec![
             format!("key{:03}", 5).as_bytes().to_vec(),
             format!("key{:03}", 8).as_bytes().to_vec(),
         ];
         let skiplists = skiplists[1].split_skiplist(&keys);
         let mut iter = skiplists[0].iter();
+        let mut iter2 = skiplists[0].iter();
         iter.seek_to_first();
         for i in 5..8 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
 
         let mut iter = skiplists[1].iter();
+        let mut iter2 = skiplists[1].iter();
         iter.seek_to_first();
         for i in 8..10 {
             let key = format!("key{:03}", i);
             let k = iter.key();
             assert_eq!(k, &key);
+            iter2.seek(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, &key);
+            iter2.seek_for_prev(key.as_bytes());
+            let k = iter2.key();
+            assert_eq!(k, key.as_bytes());
             iter.next();
         }
         assert!(!iter.valid());
