@@ -32,7 +32,9 @@ impl<M: MemoryLimiter> Arena<M> {
         assert!(self.limiter.acquire(size));
 
         let layout = Layout::from_size_align(size, U_SIZE).unwrap();
-        unsafe { std::alloc::alloc(layout) as usize }
+        let addr = unsafe { std::alloc::alloc(layout) as usize };
+        self.limiter.alloc(addr, size);
+        addr
     }
 
     pub fn free<N: ReclaimableNode>(&self, node_addr: *mut N) {
@@ -41,6 +43,7 @@ impl<M: MemoryLimiter> Arena<M> {
             node.size()
         };
 
+        self.limiter.free(node_addr as usize, size);
         let layout = Layout::from_size_align(size, U_SIZE).unwrap();
         unsafe {
             (*node_addr).drop_key_value();

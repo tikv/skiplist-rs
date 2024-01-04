@@ -73,10 +73,16 @@ impl ReclaimableNode for Node {
     }
 }
 
-pub trait MemoryLimiter: Clone {
+pub trait MemoryLimiter: AllocationRecorder {
     fn acquire(&self, n: usize) -> bool;
     fn reclaim(&self, n: usize);
     fn mem_usage(&self) -> usize;
+}
+
+// todo(SpadeA): This is used for the purpose of recording the memory footprint. It should be removed in the future.
+pub trait AllocationRecorder: Clone {
+    fn alloc(&self, addr: usize, size: usize);
+    fn free(&self, addr: usize, size: usize);
 }
 
 impl Node {
@@ -1019,7 +1025,7 @@ fn below_upper_bound<C: KeyComparator>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{collections::HashMap, sync::Mutex};
 
     use super::*;
     use crate::{fetch_stats, key::ByteWiseComparator, FixedLengthSuffixComparator, ReadableSize};
@@ -1033,20 +1039,31 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct DummyLimiter {
-        acquired: Arc<Mutex<usize>>,
+        recorder: Arc<Mutex<HashMap<usize, usize>>>,
     }
 
     impl Drop for DummyLimiter {
         fn drop(&mut self) {
-            let acquired = self.acquired.lock().unwrap();
-            assert!(*acquired == 0);
+            let recorder = self.recorder.lock().unwrap();
+            assert!(recorder.is_empty());
+        }
+    }
+
+    impl AllocationRecorder for DummyLimiter {
+        fn alloc(&self, addr: usize, size: usize) {
+            let mut recorder = self.recorder.lock().unwrap();
+            assert!(!recorder.contains_key(&addr));
+            recorder.insert(addr, size);
+        }
+
+        fn free(&self, addr: usize, size: usize) {
+            let mut recorder = self.recorder.lock().unwrap();
+            assert_eq!(recorder.remove(&addr).unwrap(), size);
         }
     }
 
     impl MemoryLimiter for DummyLimiter {
-        fn acquire(&self, n: usize) -> bool {
-            let mut acquired = self.acquired.lock().unwrap();
-            *acquired += n;
+        fn acquire(&self, _: usize) -> bool {
             true
         }
 
@@ -1054,10 +1071,7 @@ mod tests {
             0
         }
 
-        fn reclaim(&self, n: usize) {
-            let mut acquired = self.acquired.lock().unwrap();
-            *acquired -= n;
-        }
+        fn reclaim(&self, _: usize) {}
     }
 
     fn with_skl_test(f: impl FnOnce(Skiplist<FixedLengthSuffixComparator, DummyLimiter>)) {
