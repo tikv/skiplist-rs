@@ -62,7 +62,8 @@ pub trait ReclaimableNode {
 
 impl ReclaimableNode for Node {
     fn size(&self) -> usize {
-        NODE_SIZE
+        let not_used = (MAX_HEIGHT - self.height - 1) * U_SIZE;
+        NODE_SIZE - not_used
     }
 
     fn drop_key_value(&mut self) {
@@ -88,18 +89,17 @@ pub trait AllocationRecorder: Clone {
 impl Node {
     fn alloc<M: MemoryLimiter>(arena: &Arena<M>, key: Bytes, value: Bytes, height: usize) -> usize {
         // Not all values in Node::tower will be utilized.
-        // let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
-        // let node_offset = arena.alloc(NODE_SIZE - not_used);
-        let node_offset = arena.alloc(NODE_SIZE);
+        let not_used = (MAX_HEIGHT - height - 1) * U_SIZE;
+        let node_addr = arena.alloc(NODE_SIZE - not_used);
         unsafe {
-            let node_ptr: *mut Node = arena.get_mut(node_offset);
+            let node_ptr: *mut Node = arena.get_mut(node_addr);
             let node = &mut *node_ptr;
             ptr::write(&mut node.key, key);
             ptr::write(&mut node.value, value);
             node.height = height;
             ptr::write_bytes(node.tower.as_mut_ptr(), 0, height + 1);
         }
-        node_offset
+        node_addr
     }
 
     fn mark_tower(&self) -> bool {
@@ -118,7 +118,7 @@ impl Node {
         true
     }
 
-    fn next_offset(&self, height: usize) -> usize {
+    fn next_addr(&self, height: usize) -> usize {
         self.tower[height].load(Ordering::SeqCst)
     }
 }
@@ -126,12 +126,6 @@ impl Node {
 struct SkiplistInner<M: MemoryLimiter> {
     height: AtomicUsize,
     head: NonNull<Node>,
-    // After calling `link_to_key` and before `unlink`, the nodes
-    // in the skiplist is not exclusively owned by it (it owns the nodes from header to some node).
-    // Here, we record the offset of the node after the last node we owned as `end_node_offset`.
-    freeable_end_offset: AtomicUsize,
-    // readable_end_offset is used to know where is the end. Without it, we may read Node that has been dropped.
-    readable_end_offset: AtomicUsize,
     arena: Arena<M>,
 }
 
@@ -139,12 +133,11 @@ impl<M: MemoryLimiter> SkiplistInner<M> {
     pub fn print(&self) {
         println!("print the skiplist");
         unsafe {
-            for i in (0..self.height.load(Ordering::Relaxed)).rev() {
+            for i in (0..=self.height.load(Ordering::Relaxed)).rev() {
                 let mut node_off = self.head.as_ref().tower[i].load(Ordering::Relaxed);
 
                 print!("level {}", i);
-                while node_off != 0 && node_off != self.readable_end_offset.load(Ordering::Relaxed)
-                {
+                while node_off != 0 {
                     let node: *mut Node = self.arena.get_mut(node_off);
                     print!("  {:?} -->", (*node).key);
                     node_off = (*node).tower[i].load(Ordering::Relaxed);
@@ -167,15 +160,12 @@ pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
 impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     pub fn new(c: C, mem_limiter: M) -> Skiplist<C, M> {
         let arena = Arena::new(mem_limiter);
-        let head_offset = Node::alloc(&arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
-        let head = unsafe { NonNull::new_unchecked(arena.get_mut(head_offset)) };
+        let head_addr = Node::alloc(&arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
+        let head = unsafe { NonNull::new_unchecked(arena.get_mut(head_addr)) };
         Skiplist {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(0),
                 head,
-                // 0 means the sentinel tailer
-                freeable_end_offset: AtomicUsize::new(usize::MAX),
-                readable_end_offset: AtomicUsize::new(usize::MAX),
                 arena,
             }),
             c,
@@ -215,8 +205,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         let mut cursor: *const Node = self.inner.head.as_ptr();
         let mut level = self.height();
         loop {
-            let next_offset = (*cursor).next_offset(level);
-            if next_offset == 0 {
+            let next_addr = (*cursor).next_addr(level);
+            if next_addr == 0 {
                 if level > 0 {
                     level -= 1;
                     continue;
@@ -226,7 +216,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
                 return cursor;
             }
-            let next_ptr: *mut Node = self.inner.arena.get_mut(next_offset);
+            let next_ptr: *mut Node = self.inner.arena.get_mut(next_addr);
             let next = &*next_ptr;
             let res = self.c.compare_key(key, &next.key);
             if res == std::cmp::Ordering::Greater {
@@ -238,7 +228,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     return next;
                 }
                 if !less {
-                    let offset = next.next_offset(0);
+                    let offset = next.next_addr(0);
                     if offset != 0 {
                         return self.inner.arena.get_mut(offset);
                     } else {
@@ -297,7 +287,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         'search: loop {
             let mut level = self.height() + 1;
             // Fast loop to skip empty tower levels.
-            while level >= 1 && (*self.inner.head.as_ptr()).next_offset(level - 1) == 0 {
+            while level >= 1 && (*self.inner.head.as_ptr()).next_addr(level - 1) == 0 {
                 level -= 1;
             }
 
@@ -308,7 +298,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 level -= 1;
 
                 // Two adjacent nodes at the current level.
-                let mut curr = (*pred).next_offset(level);
+                let mut curr = (*pred).next_addr(level);
 
                 // If `curr` is marked, that means `pred` is removed and we have to restart the
                 // search.
@@ -319,10 +309,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 // Iterate through the current level until we reach a node with a key greater
                 // than or equal to `key`.
                 let mut curr_node: *mut Node = self.inner.arena.get_mut(curr);
-                while !curr_node.is_null()
-                    && curr != self.inner.readable_end_offset.load(Ordering::Relaxed)
-                {
-                    let succ = (*curr_node).next_offset(level);
+                while !curr_node.is_null() {
+                    let succ = (*curr_node).next_addr(level);
 
                     if tag(succ) == 1 {
                         if let Some(c) = self.help_unlink(pred, curr, succ, level) {
@@ -372,7 +360,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             'search: loop {
                 let mut level = self.height() + 1;
                 // Fast loop to skip empty tower levels.
-                while level >= 1 && (*self.inner.head.as_ptr()).next_offset(level - 1) == 0 {
+                while level >= 1 && (*self.inner.head.as_ptr()).next_addr(level - 1) == 0 {
                     level -= 1;
                 }
 
@@ -382,7 +370,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     level -= 1;
 
                     // Two adjacent nodes at the current level.
-                    let mut curr = (*pred).next_offset(level);
+                    let mut curr = (*pred).next_addr(level);
 
                     // If `curr` is marked, that means `pred` is removed and we have to restart the
                     // search.
@@ -393,10 +381,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     // Iterate through the current level until we reach a node with a key greater
                     // than or equal to `key`.
                     let mut curr_node: *mut Node = self.inner.arena.get_mut(curr);
-                    while !curr_node.is_null()
-                        && curr != self.inner.readable_end_offset.load(Ordering::Relaxed)
-                    {
-                        let succ = (*curr_node).next_offset(level);
+                    while !curr_node.is_null() {
+                        let succ = (*curr_node).next_addr(level);
 
                         if tag(succ) == 1 {
                             if let Some(c) = self.help_unlink(pred, curr, succ, level) {
@@ -455,7 +441,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                         let succ = without_tag(node.tower[level].load(Ordering::SeqCst));
 
                         match (*search.left[level]).tower[level].compare_exchange(
-                            self.inner.arena.offset(node),
+                            self.inner.arena.address(node),
                             succ,
                             Ordering::SeqCst,
                             Ordering::SeqCst,
@@ -498,16 +484,16 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     //    searches in skiplist 2 is undefined (consider the case of seek(1) in s2).
     //
     // For handeling with what described above:
-    // First, we define `freeable_end_offset`. It's used to record the end node
+    // First, we define `freeable_end_addr`. It's used to record the end node
     // this skiplist is responsible to drop, where the end node is a sentinel.
-    // Back to the above example, the `freeable_end_offset` of s1, s2, and s3 are `1`, `2`,
+    // Back to the above example, the `freeable_end_addr` of s1, s2, and s3 are `1`, `2`,
     // and tailer respectively. So we can see that s1 will drop nothing, s2 will drop `1`,
     // and s3 will drop the rest elements.
     //
-    // For the second issue, we define `readable_end_offset`. Note, split will not
+    // For the second issue, we define `readable_end_addr`. Note, split will not
     // narrow down the readable range of the original skiplist (s1 here). So we can quickly
-    // infer the `readable_end_offset` of s1, s2, and s3 are tailer, `2`, and tailer respectively.
-    // However, as the level 2 of h2 points to `4`, we will fail to use `readable_end_offset` of `2`
+    // infer the `readable_end_addr` of s1, s2, and s3 are tailer, `2`, and tailer respectively.
+    // However, as the level 2 of h2 points to `4`, we will fail to use `readable_end_addr` of `2`
     // to avoid s2 accessing element `4` at level 2.
     // Therefore, an extra step is needed: all levels of a header link to the node which originally
     // the first level of the header links to (for h2, it's `1`). Then, change the height of the node
@@ -524,29 +510,12 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     //                   h2   h3
     // For s2, 1. link level 2 of `1` to `2`, 2. link level 2 of h1 to `1`. The order guarantees
     // the correctness of the concurrent read of s1 is not compromised. Now, all levels of s2
-    // is gaurded by `readable_end_offset` of `2`.
+    // is gaurded by `readable_end_addr` of `2`.
     //
     // **Note**: although the concurent read is allowed, concurrent modification is permitted.
     pub fn split_skiplist(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
         assert!(keys.len() >= 1);
-        let cur_end_off = self.inner.freeable_end_offset.load(Ordering::Relaxed);
-        assert_ne!(cur_end_off, 0);
-        let end_key = if cur_end_off != usize::MAX {
-            unsafe {
-                let tailer_key = (*(cur_end_off as *mut Node)).key.clone();
-                assert!(self
-                    .c
-                    .compare_key(&tailer_key, keys.last().unwrap())
-                    .is_gt());
-                tailer_key
-            }
-        } else {
-            Bytes::default()
-        };
-
-        self.inner
-            .freeable_end_offset
-            .store(usize::MAX, Ordering::Relaxed);
+        let end_key = Bytes::default();
 
         let mut skiplists = vec![];
         for i in 0..keys.len() - 1 {
@@ -557,32 +526,79 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         skiplists
     }
 
+    pub fn new_header_to_list(&self, start_key: &[u8]) -> Self {
+        let arena = &self.inner.arena;
+        let new_header_addr = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
+        let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_addr)) };
+
+        let mut height = 0;
+        unsafe {
+            let search = self.search_position(start_key);
+            for i in 0..search.right.len() {
+                if search.right[i].is_null() {
+                    break;
+                }
+                new_head.as_ref().tower[i].store(arena.address(search.right[i]), Ordering::Relaxed);
+                height += 1;
+            }
+        };
+
+        Skiplist {
+            inner: Arc::new(SkiplistInner {
+                height: AtomicUsize::new(height),
+                head: new_head,
+                arena: arena.clone(),
+            }),
+            c: self.c.clone(),
+        }
+    }
+
+    pub fn cut(&self, end: &[u8]) {
+        unsafe {
+            let mut search = self.search_position(end);
+            for i in (0..search.left.len()).rev() {
+                if search.right[i].is_null() {
+                    continue;
+                }
+                loop {
+                    let right_addr = self.inner.arena.address(search.right[i]);
+                    match (*search.left[i]).tower[i].compare_exchange(
+                        right_addr,
+                        0,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            search = self.search_position(end);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Create a Skiplist with a header linking to the Node with key `key` in the current Skiplist
     ///
     /// Note: **Must** ensure no concurrent `Modifications` is performed,
     /// all subsequent caller must have a larger `key` passed in.
     fn new_list_by_link(&self, start: &[u8], end: &[u8]) -> Self {
         let arena = &self.inner.arena;
-        let new_header_offset = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
-        let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_offset)) };
+        let new_header_addr = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
+        let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_addr)) };
 
         unsafe {
             let search = self.search_position(start);
             let start_right = search.right[0];
-            let start_right_offset = arena.offset(start_right);
-            if self.inner.freeable_end_offset.load(Ordering::Relaxed) == usize::MAX {
-                self.inner
-                    .freeable_end_offset
-                    .store(start_right_offset, Ordering::Relaxed);
-            }
-            new_head.as_ref().tower[0].store(start_right_offset, Ordering::Relaxed);
+            let start_right_addr = arena.address(start_right);
+            new_head.as_ref().tower[0].store(start_right_addr, Ordering::Relaxed);
 
             for i in 1..search.right.len() {
                 if search.right[i].is_null() {
                     break;
                 }
 
-                new_head.as_ref().tower[i].store(arena.offset(search.right[i]), Ordering::SeqCst);
+                new_head.as_ref().tower[i].store(arena.address(search.right[i]), Ordering::SeqCst);
             }
         };
 
@@ -590,8 +606,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             inner: Arc::new(SkiplistInner {
                 height: AtomicUsize::new(self.height()),
                 head: new_head,
-                freeable_end_offset: AtomicUsize::new(usize::MAX),
-                readable_end_offset: AtomicUsize::new(usize::MAX),
                 arena: arena.clone(),
             }),
             c: self.c.clone(),
@@ -601,29 +615,22 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             unsafe {
                 let search = sl.search_position(end);
                 let end_right = search.right[0];
-                let end_right_offset = arena.offset(end_right);
+                let end_right_addr = arena.address(end_right);
 
                 for i in 1..search.right.len() {
                     let right_node = search.right[i];
                     if right_node.is_null() {
                         break;
                     }
-                    let right_off = arena.offset(right_node);
+                    let right_off = arena.address(right_node);
                     let left_node = search.left[i];
-                    if (*left_node).tower[i].load(Ordering::Relaxed) != end_right_offset {
+                    if (*left_node).tower[i].load(Ordering::Relaxed) != end_right_addr {
                         assert!((*end_right).height < i);
                         (*end_right).tower[i].store(right_off, Ordering::SeqCst);
-                        (*left_node).tower[i].store(end_right_offset, Ordering::SeqCst);
+                        (*left_node).tower[i].store(end_right_addr, Ordering::SeqCst);
                         (*end_right).height = i;
                     }
                 }
-
-                sl.inner
-                    .freeable_end_offset
-                    .store(end_right_offset, Ordering::Relaxed);
-                sl.inner
-                    .readable_end_offset
-                    .store(end_right_offset, Ordering::Relaxed);
             }
         }
 
@@ -646,7 +653,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             }
 
             let height = self.random_height();
-            let node_offset = Node::alloc(&self.inner.arena, key, value, height);
+            let node_addr = Node::alloc(&self.inner.arena, key, value, height);
             while height > list_height {
                 match self.inner.height.compare_exchange_weak(
                     list_height,
@@ -659,19 +666,14 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
             }
 
-            let n: &mut Node = &mut *self.inner.arena.get_mut(node_offset);
+            let n: &mut Node = &mut *self.inner.arena.get_mut(node_addr);
             loop {
                 // Set the lowest successor of `n` to `search.right[0]`.
-                let right_offset = self.inner.arena.offset(search.right[0]);
-                n.tower[0].store(right_offset, Ordering::SeqCst);
+                let right_addr = self.inner.arena.address(search.right[0]);
+                n.tower[0].store(right_addr, Ordering::SeqCst);
                 // Try installing the new node into the skip list (at level 0).
                 if (*search.left[0]).tower[0]
-                    .compare_exchange(
-                        right_offset,
-                        node_offset,
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
+                    .compare_exchange(right_addr, node_addr, Ordering::SeqCst, Ordering::SeqCst)
                     .is_ok()
                 {
                     break;
@@ -697,7 +699,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     // Obtain the predecessor and successor at the current level.
                     let pred = search.left[level];
                     let succ = search.right[level];
-                    let succ_offset = self.inner.arena.offset(succ);
+                    let succ_addr = self.inner.arena.address(succ);
 
                     // Load the current value of the pointer in the tower at this level.
                     // TODO(Amanieu): can we use relaxed ordering here?
@@ -719,7 +721,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     // operation fails, that means another thread has marked the pointer and we
                     // should stop building the tower.
                     if n.tower[level]
-                        .compare_exchange(next, succ_offset, Ordering::SeqCst, Ordering::SeqCst)
+                        .compare_exchange(next, succ_addr, Ordering::SeqCst, Ordering::SeqCst)
                         .is_err()
                     {
                         break 'build;
@@ -727,12 +729,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
                     // Try installing the new node at the current level.
                     if (*pred).tower[level]
-                        .compare_exchange(
-                            succ_offset,
-                            node_offset,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
+                        .compare_exchange(succ_addr, node_addr, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
                         // Success! Continue on the next level.
@@ -749,7 +746,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
             }
 
-            if tag(n.next_offset(height)) == 1 {
+            if tag(n.next_addr(height)) == 1 {
                 self.search_bound(&n.key, false, true);
             }
 
@@ -759,15 +756,15 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
     pub fn is_empty(&self) -> bool {
         let node = self.inner.head.as_ptr();
-        let next_offset = unsafe { (*node).next_offset(0) };
-        next_offset == 0
+        let next_addr = unsafe { (*node).next_addr(0) };
+        next_addr == 0
     }
 
     pub fn len(&self) -> usize {
         let mut node = self.inner.head.as_ptr();
         let mut count = 0;
         loop {
-            let next = unsafe { (*node).next_offset(0) };
+            let next = unsafe { (*node).next_addr(0) };
             if next != 0 {
                 count += 1;
                 node = unsafe { self.inner.arena.get_mut(next) };
@@ -781,7 +778,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         let mut node = self.inner.head.as_ptr();
         let mut level = self.height();
         loop {
-            let next = unsafe { (*node).next_offset(level) };
+            let next = unsafe { (*node).next_addr(level) };
             if next != 0 {
                 node = unsafe { self.inner.arena.get_mut(next) };
                 continue;
@@ -847,16 +844,11 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
 impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
         let mut node = self.head.as_ptr();
-        let end_off = self.freeable_end_offset.load(Ordering::Relaxed);
         loop {
-            let next = unsafe { (*node).next_offset(0) };
+            let next = unsafe { (*node).next_addr(0) };
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
                 self.arena.free(node);
-                if next_ptr as usize == end_off {
-                    return;
-                }
-
                 node = next_ptr;
                 continue;
             }
@@ -908,21 +900,10 @@ impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C,
     pub fn next(&mut self) {
         assert!(self.valid());
         unsafe {
-            let cursor_offset = (*(*self.cursor)).next_offset(0);
-            if cursor_offset
-                == self
-                    .list
-                    .as_ref()
-                    .inner
-                    .readable_end_offset
-                    .load(Ordering::Relaxed)
-            {
-                self.cursor = NodeWrap(ptr::null());
-                return;
-            }
-            self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(cursor_offset));
+            let cursor_addr = (*(*self.cursor)).next_addr(0);
+            self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(cursor_addr));
             while !self.cursor.is_null() {
-                let next = (*(*self.cursor)).next_offset(0);
+                let next = (*(*self.cursor)).next_addr(0);
                 if tag(next) == 1 {
                     // current is marked
                     self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(next));
@@ -969,11 +950,11 @@ impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C,
 
     pub fn seek_to_first(&mut self) {
         unsafe {
-            let cursor_offset = (*self.list.as_ref().inner.head.as_ptr()).next_offset(0);
+            let cursor_addr = (*self.list.as_ref().inner.head.as_ptr()).next_addr(0);
 
-            self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(cursor_offset));
+            self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(cursor_addr));
             while !self.cursor.is_null() {
-                let next = (*(*self.cursor)).next_offset(0);
+                let next = (*(*self.cursor)).next_addr(0);
                 if tag(next) == 1 {
                     // current is marked
                     self.cursor = NodeWrap(self.list.as_ref().inner.arena.get_mut(next));
@@ -1057,6 +1038,10 @@ mod tests {
         }
 
         fn free(&self, addr: usize, size: usize) {
+            // let node = addr as *mut Node;
+            // unsafe {
+            //     println!("{:?}", (*node).key);
+            // }
             let mut recorder = self.recorder.lock().unwrap();
             assert_eq!(recorder.remove(&addr).unwrap(), size);
         }
@@ -1484,5 +1469,45 @@ mod tests {
             iter.next();
         }
         assert!(!iter.valid());
+    }
+
+    #[test]
+    fn test_cut() {
+        for _ in 0..1000 {
+            let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+            for i in 0..30 {
+                let key = Bytes::from(format!("key{:03}", i));
+                let value = Bytes::from(format!("value{:03}", i));
+                sklist.put(key, value);
+            }
+
+            let keys = vec![
+                format!("key{:03}", 0).as_bytes().to_vec(),
+                format!("key{:03}", 10).as_bytes().to_vec(),
+                format!("key{:03}", 20).as_bytes().to_vec(),
+            ];
+
+            let s1 = sklist.new_header_to_list(&keys[0]);
+            let s2 = sklist.new_header_to_list(&keys[1]);
+            let s3 = sklist.new_header_to_list(&keys[2]);
+
+            s2.cut(&keys[2]);
+            s1.cut(&keys[1]);
+            sklist.cut(&keys[0]);
+
+            // after cut
+            let mut i = 0;
+            for s in [&s1, &s2, &s3] {
+                let mut iter = s.iter();
+                iter.seek_to_first();
+                while iter.valid() {
+                    let key = format!("key{:03}", i);
+                    let k = iter.key();
+                    assert_eq!(k, key.as_bytes());
+                    iter.next();
+                    i += 1;
+                }
+            }
+        }
     }
 }
