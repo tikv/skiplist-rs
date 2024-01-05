@@ -1479,36 +1479,57 @@ mod tests {
 
     #[test]
     fn test_cut() {
-        for _ in 0..1000 {
+        for _ in 0..10 {
             let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
-            for i in 0..30 {
-                let key = Bytes::from(format!("key{:03}", i));
-                let value = Bytes::from(format!("value{:03}", i));
-                sklist.put(key, value);
+
+            let n = 10;
+            for k in 0..n {
+                for i in k * 10000..k * 10000 + 100 {
+                    let key = Bytes::from(format!("key{:010}", i));
+                    let value = Bytes::from(format!("value{:010}", i));
+                    sklist.put(key, value);
+                }
             }
 
-            let keys = vec![
-                format!("key{:03}", 0).as_bytes().to_vec(),
-                format!("key{:03}", 10).as_bytes().to_vec(),
-                format!("key{:03}", 20).as_bytes().to_vec(),
-            ];
+            let mut split_keys: Vec<_> = (0..n - 1)
+                .into_iter()
+                .map(|i| format!("key{:010}", i * 10000 + 200).as_bytes().to_vec())
+                .collect();
+            split_keys.insert(0, format!("key{:010}", 0).as_bytes().to_vec());
 
-            let s1 = sklist.new_header_to_list(&keys[0]);
-            let s2 = sklist.new_header_to_list(&keys[1]);
-            let s3 = sklist.new_header_to_list(&keys[2]);
+            let mut lists = vec![];
+            for key in &split_keys {
+                lists.push(sklist.new_header_to_list(key));
+            }
 
-            s2.cut(&keys[2]);
-            s1.cut(&keys[1]);
-            sklist.cut(&keys[0]);
+            let mut handles = vec![];
+            for k in 0..n {
+                let l = lists[k].clone();
+                handles.push(std::thread::spawn(move || {
+                    for i in k * 10000 + 100..(k + 1) * 10000 {
+                        let key = Bytes::from(format!("key{:010}", i));
+                        let value = Bytes::from(format!("value{:010}", i));
+                        l.put(key, value);
+                    }
+                }))
+            }
 
-            // after cut
+            sklist.cut(&split_keys[0]);
+            for i in 1..n {
+                lists[i - 1].cut(&split_keys[i]);
+            }
+
+            for h in handles {
+                h.join().unwrap();
+            }
+
             let mut i = 0;
-            for s in [&s1, &s2, &s3] {
+            for s in lists {
                 let mut iter = s.iter();
                 iter.seek_to_first();
                 while iter.valid() {
-                    let key = format!("key{:03}", i);
                     let k = iter.key();
+                    let key = format!("key{:010}", i);
                     assert_eq!(k, key.as_bytes());
                     iter.next();
                     i += 1;
