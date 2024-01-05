@@ -526,7 +526,13 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         skiplists
     }
 
-    pub fn new_header_to_list(&self, start_key: &[u8]) -> Self {
+    pub fn new_headers_to_list(&self, keys: Vec<Vec<u8>>) -> Vec<Self> {
+        keys.into_iter()
+            .map(|k| self.new_header_to_list(&k))
+            .collect()
+    }
+
+    fn new_header_to_list(&self, start_key: &[u8]) -> Self {
         let arena = &self.inner.arena;
         let new_header_addr = Node::alloc(arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
         let new_head = unsafe { NonNull::<Node>::new_unchecked(arena.get_mut(new_header_addr)) };
