@@ -526,7 +526,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         skiplists
     }
 
-    pub fn new_headers_to_list(&self, keys: Vec<Vec<u8>>) -> Vec<Self> {
+    pub fn new_headers_to_list(&self, keys: &Vec<Vec<u8>>) -> Vec<Self> {
         keys.into_iter()
             .map(|k| self.new_header_to_list(&k))
             .collect()
