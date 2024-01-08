@@ -859,6 +859,7 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
             let next = unsafe { (*node).next_addr(0) };
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
+                println!("remove node {:?}", unsafe { (*node).key });
                 self.arena.free(node);
                 node = next_ptr;
                 continue;
