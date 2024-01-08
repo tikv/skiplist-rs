@@ -573,7 +573,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
                 loop {
                     let right_addr = self.inner.arena.address(search.right[i]);
-                    println!("level {}, cut to {:?}", i, (*search.right[i]).key);
+                    if i == 0 {
+                        println!("level {}, cut to {:?}", i, (*search.right[i]).key);
+                    }
                     match (*search.left[i]).tower[i].compare_exchange(
                         right_addr,
                         0,
