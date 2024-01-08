@@ -51,6 +51,12 @@ pub struct Node {
     tower: [AtomicUsize; MAX_HEIGHT],
 }
 
+impl Node {
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+}
+
 pub const U_SIZE: usize = mem::size_of::<AtomicUsize>();
 pub const NODE_SIZE: usize = mem::size_of::<Node>();
 
