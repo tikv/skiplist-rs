@@ -867,6 +867,9 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
                 node = next_ptr;
                 continue;
             }
+            unsafe {
+                println!("remove node {:?}", (*node).key);
+            }
             self.arena.free(node);
             return;
         }
