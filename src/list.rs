@@ -780,24 +780,24 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    fn find_last(&self) -> *const Node {
-        let mut node = self.inner.head.as_ptr();
-        let mut level = self.height();
-        loop {
-            let next = unsafe { (*node).next_addr(level) };
-            if next != 0 {
-                node = unsafe { self.inner.arena.get_mut(next) };
-                continue;
-            }
-            if level == 0 {
-                if node == self.inner.head.as_ptr() {
-                    return ptr::null();
-                }
-                return node;
-            }
-            level -= 1;
-        }
-    }
+    // fn find_last(&self) -> *const Node {
+    //     let mut node = self.inner.head.as_ptr();
+    //     let mut level = self.height();
+    //     loop {
+    //         let next = unsafe { (*node).next_addr(level) };
+    //         if next != 0 {
+    //             node = unsafe { self.inner.arena.get_mut(next) };
+    //             continue;
+    //         }
+    //         if level == 0 {
+    //             if node == self.inner.head.as_ptr() {
+    //                 return ptr::null();
+    //             }
+    //             return node;
+    //         }
+    //         level -= 1;
+    //     }
+    // }
 
     pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
         if let Some((_, value)) = self.get_with_key(key) {
@@ -971,9 +971,9 @@ impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C,
         }
     }
 
-    pub fn seek_to_last(&mut self) {
-        self.cursor = NodeWrap(self.list.as_ref().find_last());
-    }
+    // pub fn seek_to_last(&mut self) {
+    //     self.cursor = NodeWrap(self.list.as_ref().find_last());
+    // }
 }
 
 /// Helper function to check if a value is above a lower bound
@@ -1044,10 +1044,10 @@ mod tests {
         }
 
         fn free(&self, addr: usize, size: usize) {
-            // let node = addr as *mut Node;
-            // unsafe {
-            //     println!("{:?}", (*node).key);
-            // }
+            let node = addr as *mut Node;
+            unsafe {
+                println!("{:?}", (*node).key);
+            }
             let mut recorder = self.recorder.lock().unwrap();
             assert_eq!(recorder.remove(&addr).unwrap(), size);
         }
