@@ -544,7 +544,11 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 if search.right[i].is_null() {
                     break;
                 }
-                println!("header link to key {:?}", (*search.right[i]).key);
+                println!(
+                    "level {}, header link to key {:?}",
+                    i,
+                    (*search.right[i]).key
+                );
                 new_head.as_ref().tower[i].store(arena.address(search.right[i]), Ordering::Relaxed);
                 height += 1;
             }
