@@ -164,7 +164,7 @@ pub struct Skiplist<C: KeyComparator, M: MemoryLimiter> {
 }
 
 impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
-    pub fn new(c: C, mem_limiter: M) -> Skiplist<C, M> {
+    pub fn new(c: C, mem_limiter: Arc<M>) -> Skiplist<C, M> {
         let arena = Arena::new(mem_limiter);
         let head_addr = Node::alloc(&arena, Bytes::new(), Bytes::new(), MAX_HEIGHT - 1);
         let head = unsafe { NonNull::new_unchecked(arena.get_mut(head_addr)) };
@@ -936,7 +936,7 @@ mod tests {
 
     fn with_skl_test(f: impl FnOnce(Skiplist<FixedLengthSuffixComparator, DummyLimiter>)) {
         let comp = FixedLengthSuffixComparator::new(8);
-        let list = Skiplist::new(comp, DummyLimiter::default());
+        let list = Skiplist::new(comp, Arc::default());
         f(list);
     }
 
@@ -993,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_skl_remove() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
         for i in 0..30 {
             let key = Bytes::from(format!("key{:03}", i));
             let value = Bytes::from(format!("value{:03}", i));
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_iter_remove() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
         let mut i = 0;
         let num = 10;
         while i < num {
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[test]
     fn test_skl_remove2() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
         let mut i = 0;
 
         let num = 10000000;
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn test_skl_remove3() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
         let mut i = 0;
         while i < 10000 {
             let key = Bytes::from(format!("key{:05}", i));
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[test]
     fn test_iter_remove4() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+        let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
         let mut i = 0;
         let num = 2000000;
         while i < num {
@@ -1201,7 +1201,7 @@ mod tests {
     #[test]
     fn test_cut() {
         for _ in 0..10 {
-            let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
+            let sklist = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
 
             let n = 10;
             for k in 0..n {
