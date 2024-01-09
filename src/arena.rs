@@ -20,10 +20,8 @@ pub fn without_tag(offset: usize) -> usize {
 }
 
 impl<M: MemoryLimiter> Arena<M> {
-    pub fn new(limiter: M) -> Self {
-        Arena {
-            limiter: Arc::new(limiter),
-        }
+    pub fn new(limiter: Arc<M>) -> Self {
+        Arena { limiter }
     }
 
     /// Alloc 8-byte aligned memory.
