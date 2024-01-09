@@ -198,72 +198,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 }
 
 impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
-    /// Finds the node near to key.
-    ///
-    /// If less=true, it finds rightmost node such that node.key < key (if
-    /// allow_equal=false) or node.key <= key (if allow_equal=true).
-    /// If less=false, it finds leftmost node such that node.key > key (if
-    /// allow_equal=false) or node.key >= key (if allow_equal=true).
-    ///
-    /// Returns the node found. The bool returned is true if the node has key
-    /// equal to given key.
-    unsafe fn find_near(&self, key: &[u8], less: bool, allow_equal: bool) -> *const Node {
-        let mut cursor: *const Node = self.inner.head.as_ptr();
-        let mut level = self.height();
-        loop {
-            let next_addr = (*cursor).next_addr(level);
-            if next_addr == 0 {
-                if level > 0 {
-                    level -= 1;
-                    continue;
-                }
-                if !less || cursor == self.inner.head.as_ptr() {
-                    return ptr::null();
-                }
-                return cursor;
-            }
-            let next_ptr: *mut Node = self.inner.arena.get_mut(next_addr);
-            let next = &*next_ptr;
-            let res = self.c.compare_key(key, &next.key);
-            if res == std::cmp::Ordering::Greater {
-                cursor = next_ptr;
-                continue;
-            }
-            if res == std::cmp::Ordering::Equal {
-                if allow_equal {
-                    return next;
-                }
-                if !less {
-                    let offset = next.next_addr(0);
-                    if offset != 0 {
-                        return self.inner.arena.get_mut(offset);
-                    } else {
-                        return ptr::null();
-                    }
-                }
-                if level > 0 {
-                    level -= 1;
-                    continue;
-                }
-                if cursor == self.inner.head.as_ptr() {
-                    return ptr::null();
-                }
-                return cursor;
-            }
-            if level > 0 {
-                level -= 1;
-                continue;
-            }
-            if !less {
-                return next;
-            }
-            if cursor == self.inner.head.as_ptr() {
-                return ptr::null();
-            }
-            return cursor;
-        }
-    }
-
     unsafe fn help_unlink(
         &self,
         prev: *mut Node,
@@ -284,6 +218,12 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
+    /// Finds the node near to key.
+    ///
+    /// If upper_bound=true, it finds rightmost node such that node.key < key (if
+    /// allow_equal=false) or node.key <= key (if allow_equal=true).
+    /// If upper_bound=false, it finds leftmost node such that node.key > key (if
+    /// allow_equal=false) or node.key >= key (if allow_equal=true).
     unsafe fn search_bound(
         &self,
         key: &[u8],
@@ -745,7 +685,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     }
 
     pub fn get_with_key(&self, key: &[u8]) -> Option<(&Bytes, &Bytes)> {
-        let node = unsafe { self.find_near(key, false, true) };
+        let node = unsafe { self.search_bound(key, false, true)? };
         if node.is_null() {
             return None;
         }
@@ -907,10 +847,6 @@ impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C,
             }
         }
     }
-
-    // pub fn seek_to_last(&mut self) {
-    //     self.cursor = NodeWrap(self.list.as_ref().find_last());
-    // }
 }
 
 /// Helper function to check if a value is above a lower bound
@@ -1005,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skl_find_near() {
+    fn test_skl_search_bound() {
         with_skl_test(|list| {
             for i in 0..1000 {
                 let key = Bytes::from(format!("{:05}{:08}", i * 10 + 5, 0));
