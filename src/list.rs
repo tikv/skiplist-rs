@@ -469,56 +469,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    // Split the skiplist by using new headers linking to the target start Node.
-    // Say we have a skiplist with 2 levels:
-    //              h1         ->        4 ->  tailer
-    //              h1 -> 1 -> 2 -> 3 -> 4 -> tailer
-    //              and split key is 2. here we pass [1, 2] as parameters.
-    // After the header link, the skiplist becomes:
-    //                                 h2 h3
-    //                                  | |
-    //                                  v v
-    //              h1          ->       4 -> tailer
-    //              h1 -> 1 -> 2 -> 3 -> 4 -> tailer
-    //                    ^    ^
-    //                    |    |
-    //                   h2   h3
-    // It returns two skiplists (s1, and s2), h2, which starts from 1, and h3 which starts from 2.
-    // **Now, there are two problems here**:
-    // 1. if h1/h2 is dropped, it can drop the elements of h3
-    // 2. the level 2 of h2 points to `4`, if h3 is dropped which frees it's elements,
-    //    searches in skiplist 2 is undefined (consider the case of seek(1) in s2).
-    //
-    // For handeling with what described above:
-    // First, we define `freeable_end_addr`. It's used to record the end node
-    // this skiplist is responsible to drop, where the end node is a sentinel.
-    // Back to the above example, the `freeable_end_addr` of s1, s2, and s3 are `1`, `2`,
-    // and tailer respectively. So we can see that s1 will drop nothing, s2 will drop `1`,
-    // and s3 will drop the rest elements.
-    //
-    // For the second issue, we define `readable_end_addr`. Note, split will not
-    // narrow down the readable range of the original skiplist (s1 here). So we can quickly
-    // infer the `readable_end_addr` of s1, s2, and s3 are tailer, `2`, and tailer respectively.
-    // However, as the level 2 of h2 points to `4`, we will fail to use `readable_end_addr` of `2`
-    // to avoid s2 accessing element `4` at level 2.
-    // Therefore, an extra step is needed: all levels of a header link to the node which originally
-    // the first level of the header links to (for h2, it's `1`). Then, change the height of the node
-    // and make the node inserted in the relevant level.
-    //
-    // Back to the example, the skiplist becomes:
-    //                   h2    h3
-    //                    |    |
-    //                    v    v
-    //              h1 -> 1 -> 2     ->    4 -> tailer
-    //              h1 -> 1 -> 2 -> 3  ->  4 -> tailer
-    //                    ^    ^
-    //                    |    |
-    //                   h2   h3
-    // For s2, 1. link level 2 of `1` to `2`, 2. link level 2 of h1 to `1`. The order guarantees
-    // the correctness of the concurrent read of s1 is not compromised. Now, all levels of s2
-    // is gaurded by `readable_end_addr` of `2`.
-    //
-    // **Note**: although the concurent read is allowed, concurrent modification is permitted.
     pub fn split_skiplist(&self, keys: &Vec<Vec<u8>>) -> Vec<Skiplist<C, M>> {
         assert!(keys.len() >= 1);
         let end_key = Bytes::default();
@@ -550,11 +500,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 if search.right[i].is_null() {
                     break;
                 }
-                println!(
-                    "level {}, header link to key {:?}",
-                    i,
-                    (*search.right[i]).key
-                );
                 new_head.as_ref().tower[i].store(arena.address(search.right[i]), Ordering::Relaxed);
                 height += 1;
             }
@@ -579,9 +524,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 }
                 loop {
                     let right_addr = self.inner.arena.address(search.right[i]);
-                    if i == 0 {
-                        println!("level {}, cut to {:?}", i, (*search.right[i]).key);
-                    }
                     match (*search.left[i]).tower[i].compare_exchange(
                         right_addr,
                         0,
@@ -794,25 +736,6 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    // fn find_last(&self) -> *const Node {
-    //     let mut node = self.inner.head.as_ptr();
-    //     let mut level = self.height();
-    //     loop {
-    //         let next = unsafe { (*node).next_addr(level) };
-    //         if next != 0 {
-    //             node = unsafe { self.inner.arena.get_mut(next) };
-    //             continue;
-    //         }
-    //         if level == 0 {
-    //             if node == self.inner.head.as_ptr() {
-    //                 return ptr::null();
-    //             }
-    //             return node;
-    //         }
-    //         level -= 1;
-    //     }
-    // }
-
     pub fn get(&self, key: &[u8]) -> Option<&Bytes> {
         if let Some((_, value)) = self.get_with_key(key) {
             Some(value)
@@ -868,15 +791,9 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
             let next = unsafe { (*node).next_addr(0) };
             if next != 0 {
                 let next_ptr = unsafe { self.arena.get_mut(next) };
-                unsafe {
-                    println!("remove node {:?}", (*node).key);
-                }
                 self.arena.free(node);
                 node = next_ptr;
                 continue;
-            }
-            unsafe {
-                println!("remove node {:?}", (*node).key);
             }
             self.arena.free(node);
             return;
@@ -1064,10 +981,6 @@ mod tests {
         }
 
         fn free(&self, addr: usize, size: usize) {
-            let node = addr as *mut Node;
-            unsafe {
-                println!("{:?}", (*node).key);
-            }
             let mut recorder = self.recorder.lock().unwrap();
             assert_eq!(recorder.remove(&addr).unwrap(), size);
         }
@@ -1347,154 +1260,6 @@ mod tests {
             iter.next();
         }
         assert!(count == 0);
-    }
-
-    #[test]
-    fn test_link_to_key() {
-        let sklist = Skiplist::new(ByteWiseComparator {}, DummyLimiter::default());
-        for i in 0..30 {
-            let key = Bytes::from(format!("key{:03}", i));
-            let value = Bytes::from(format!("value{:03}", i));
-            sklist.put(key, value);
-        }
-
-        let keys = vec![
-            format!("key{:03}", 0).as_bytes().to_vec(),
-            format!("key{:03}", 10).as_bytes().to_vec(),
-            format!("key{:03}", 20).as_bytes().to_vec(),
-        ];
-        let skiplists = sklist.split_skiplist(&keys);
-        drop(sklist);
-        let mut iter = skiplists[0].iter();
-        let mut iter2 = skiplists[0].iter();
-        iter.seek_to_first();
-        for i in 0..10 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        let mut iter = skiplists[1].iter();
-        let mut iter2 = skiplists[1].iter();
-        iter.seek_to_first();
-        for i in 10..20 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        let mut iter = skiplists[2].iter();
-        let mut iter2 = skiplists[2].iter();
-        iter.seek_to_first();
-        for i in 20..30 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        // split again
-        let keys = vec![
-            format!("key{:03}", 0).as_bytes().to_vec(),
-            format!("key{:03}", 5).as_bytes().to_vec(),
-        ];
-        let skiplists = skiplists[0].split_skiplist(&keys);
-        let mut iter = skiplists[0].iter();
-        let mut iter2 = skiplists[0].iter();
-        iter.seek_to_first();
-        for i in 0..5 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        let mut iter = skiplists[1].iter();
-        let mut iter2 = skiplists[1].iter();
-        iter.seek_to_first();
-        for i in 5..10 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        // split again
-        let keys = vec![
-            format!("key{:03}", 5).as_bytes().to_vec(),
-            format!("key{:03}", 8).as_bytes().to_vec(),
-        ];
-        let skiplists = skiplists[1].split_skiplist(&keys);
-        let mut iter = skiplists[0].iter();
-        let mut iter2 = skiplists[0].iter();
-        iter.seek_to_first();
-        for i in 5..8 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
-
-        let mut iter = skiplists[1].iter();
-        let mut iter2 = skiplists[1].iter();
-        iter.seek_to_first();
-        for i in 8..10 {
-            let key = format!("key{:03}", i);
-            let k = iter.key();
-            assert_eq!(k, &key);
-            iter2.seek(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, &key);
-            iter2.seek_for_prev(key.as_bytes());
-            let k = iter2.key();
-            assert_eq!(k, key.as_bytes());
-            iter.next();
-        }
-        assert!(!iter.valid());
     }
 
     #[test]
