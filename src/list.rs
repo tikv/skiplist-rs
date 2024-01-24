@@ -1,6 +1,5 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
-use core::slice::SlicePattern;
 use std::{
     cmp, mem,
     ops::{Deref, Index},
@@ -98,8 +97,8 @@ impl Deref for Head {
 #[derive(Debug)]
 #[repr(C)]
 pub struct Node {
-    key: Bytes,
-    value: Bytes,
+    pub(crate) key: Bytes,
+    pub(crate) value: Bytes,
     /// Keeps the reference count and the height of its tower.
     ///
     /// The reference count is equal to the number of `Entry`s pointing to this node, plus the
@@ -126,10 +125,11 @@ pub trait ReclaimableNode {
 
 impl ReclaimableNode for Node {
     fn size(&self) -> usize {
-        0
+        Node::node_size(self.height())
     }
 
     fn drop_key_value(&mut self) {
+        println!("{:?}", self.key);
         unsafe {
             ptr::drop_in_place(&mut self.key);
             ptr::drop_in_place(&mut self.value);
@@ -146,8 +146,8 @@ pub trait MemoryLimiter: AllocationRecorder {
 // todo(SpadeA): This is used for the purpose of recording the memory footprint.
 // It should be removed in the future.
 pub trait AllocationRecorder: Clone {
-    fn alloc(&self, addr: usize, size: usize);
-    fn free(&self, addr: usize, size: usize);
+    fn allocated(&self, addr: usize, size: usize);
+    fn freed(&self, addr: usize, size: usize);
 }
 
 impl Node {
@@ -216,6 +216,7 @@ impl Node {
         true
     }
 
+    #[allow(dead_code)]
     #[inline]
     unsafe fn try_increment(&self) -> bool {
         let mut refs_and_height = self.refs_and_height.load(Ordering::Relaxed);
@@ -255,13 +256,13 @@ impl Node {
             >> HEIGHT_BITS;
         if current_ref == 1 {
             fence(Ordering::Acquire);
-            guard.defer(move || Self::finalize(self, arena));
+            guard.defer(move || Self::finalize(self, &arena));
         }
     }
 
     /// Drops the key and value of a node, then deallocates it.
     #[cold]
-    unsafe fn finalize<M: MemoryLimiter>(ptr: *const Self, arena: Arena<M>) {
+    unsafe fn finalize<M: MemoryLimiter>(ptr: *const Self, arena: &Arena<M>) {
         let ptr = ptr as *mut Self;
         arena.free(ptr);
     }
@@ -581,7 +582,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    pub fn remove(&self, key: &[u8], guard: &Guard) {
+    pub fn remove(&self, key: &[u8], guard: &Guard) -> bool {
         self.check_guard(guard);
 
         unsafe {
@@ -595,11 +596,11 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 let search = self.search_position(key, guard);
 
                 let Some(n) = search.found else {
-                    return;
+                    return false;
                 };
 
                 // Try removing the node by marking its tower.
-                if (*n).mark_tower() {
+                if n.mark_tower() {
                     for level in (0..n.height()).rev() {
                         let succ = n.tower[level].load(Ordering::SeqCst, guard).with_tag(0);
 
@@ -620,13 +621,13 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                         }
                     }
 
-                    return;
+                    return true;
                 }
             }
         }
     }
 
-    pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>, guard: &Guard) {
+    pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>, guard: &Guard) -> bool {
         let (key, value) = (key.into(), value.into());
         self.check_guard(guard);
 
@@ -640,8 +641,9 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             // First try searching for the key.
             // Note that the `Ord` implementation for `K` may panic during the search.
             search = self.search_position(&key, guard);
-            if let Some(r) = search.found {
-                panic!("Overwrite is not supported, {:?}", (*r).key);
+            if let Some(_) = search.found {
+                // panic!("Overwrite is not supported, {:?}", (*r).key);
+                return false;
             }
 
             let height = self.random_height();
@@ -665,17 +667,15 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 {
                     // Create a guard that destroys the new node in case search panics.
                     let sg = scopeguard::guard((), |_| {
-                        Node::finalize(node.as_raw(), self.inner.arena.clone())
+                        Node::finalize(node.as_raw(), &self.inner.arena.clone())
                     });
                     search = self.search_position(&n.key, guard);
                     mem::forget(sg);
                 }
 
-                if let Some(r) = search.found {
-                    if (*r).value != n.value {
-                        panic!("Overwrite is not supported, {:?}", (*r).key);
-                    }
-                    return;
+                if let Some(_) = search.found {
+                    // panic!("Overwrite is not supported, {:?}", (*r).key);
+                    return false;
                 }
             }
 
@@ -744,17 +744,19 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                 self.search_bound(Bound::Included(&n.key), false, guard);
             }
         }
+
+        true
     }
 
     pub fn is_empty(&self) -> bool {
         true
     }
 
-    pub fn get<'a>(&'a self, key: &[u8], guard: &'a Guard) -> Option<Entry> {
+    pub fn get<'a>(&self, key: &[u8], guard: &'a Guard) -> Option<Entry<'a>> {
         self.check_guard(guard);
         if let Some(n) = unsafe { self.search_bound(Bound::Included(key), false, guard) } {
             if self.c.same_key(&n.key, key) {
-                return Some(Entry { node: n, guard });
+                return Some(unsafe { Entry::new(n, guard) });
             }
         }
 
@@ -762,11 +764,11 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     }
 
     fn next_node<'a>(
-        &'a self,
-        pred: &'a Tower,
+        &self,
+        pred: &Tower,
         lower_bound: Bound<&[u8]>,
         guard: &'a Guard,
-    ) -> Option<*const Node> {
+    ) -> Option<&'a Node> {
         unsafe {
             // Load the level 0 successor of the current node.
             let mut curr = pred[0].load_consume(guard);
@@ -776,7 +778,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             if curr.tag() == 1 {
                 return self
                     .search_bound(lower_bound, false, guard)
-                    .map(|n| n as *const _);
+                    .map(|n| Entry::lifetime_with_guard(n, guard));
             }
 
             while let Some(c) = curr.as_ref() {
@@ -792,11 +794,11 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                         // searching from the current position. Restart the search.
                         return self
                             .search_bound(lower_bound, false, guard)
-                            .map(|n| n as *const _);
+                            .map(|n| Entry::lifetime_with_guard(n, guard));
                     }
                 }
 
-                return Some(c as *const _);
+                return Some(Entry::lifetime_with_guard(c, guard));
             }
 
             None
@@ -835,7 +837,25 @@ impl<C: KeyComparator, M: MemoryLimiter> AsRef<Skiplist<C, M>> for Skiplist<C, M
 
 impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
     fn drop(&mut self) {
-        // todo
+        unsafe {
+            let mut node = self.head[0]
+                .load(Ordering::Relaxed, crossbeam_epoch::unprotected())
+                .as_ref();
+
+            // Iterate through the whole skip list and destroy every node.
+            while let Some(n) = node {
+                // Unprotected loads are okay because this function is the only one currently using
+                // the skip list.
+                let next = n.tower[0]
+                    .load(Ordering::Relaxed, crossbeam_epoch::unprotected())
+                    .as_ref();
+
+                // Deallocate every node.
+                Node::finalize(n, &self.arena);
+
+                node = next;
+            }
+        }
     }
 }
 
@@ -848,24 +868,21 @@ unsafe impl<C: Sync + KeyComparator, M: MemoryLimiter> Sync for Skiplist<C, M> {
 /// used when creating the `Entry` (`'g`).
 pub struct Entry<'g> {
     node: &'g Node,
-    guard: &'g Guard,
 }
 
 impl<'g> Entry<'g> {
-    unsafe fn try_acquire(guard: &'g Guard, node: &Node) -> *const Node {
-        assert!(node.try_increment());
+    unsafe fn new(node: &Node, _: &'g Guard) -> Self {
+        Self {
+            node: &*(node as *const _),
+        }
+    }
+
+    unsafe fn lifetime_with_guard(node: &Node, _: &'g Guard) -> &'g Node {
         &*(node as *const _)
     }
-}
 
-pub struct NodeWrap(*const Node);
-unsafe impl Send for NodeWrap {}
-
-impl Deref for NodeWrap {
-    type Target = *const Node;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+    pub fn value(&self) -> &Bytes {
+        &self.node.value
     }
 }
 
@@ -874,7 +891,7 @@ where
     T: AsRef<Skiplist<C, M>>,
 {
     list: T,
-    cursor: Option<*const Node>,
+    cursor: Option<&'g Node>,
     guard: &'g Guard,
     _key_cmp: std::marker::PhantomData<C>,
     _limiter: std::marker::PhantomData<M>,
@@ -887,7 +904,7 @@ impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'
 
     pub fn key(&self) -> &Bytes {
         assert!(self.valid());
-        unsafe { &(&**self.cursor.as_ref().unwrap()).key }
+        &(&**self.cursor.as_ref().unwrap()).key
     }
 
     pub fn value(&self) -> &Bytes {
@@ -898,60 +915,13 @@ impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'
 
     pub fn next(&mut self) {
         self.cursor = match self.cursor {
-            Some(n) => {
-                let node = unsafe { &*n };
-                self.list
-                    .as_ref()
-                    .next_node(&node.tower, Bound::Excluded(&node.key), self.guard)
-            }
+            Some(n) => self
+                .list
+                .as_ref()
+                .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
             None => unreachable!(),
         }
     }
-
-    // fn next1(&'a mut self) {
-    //     let n = self.cursor.take().unwrap();
-    //     let pred = &n.node.tower;
-    //     let lower_bound = Bound::Excluded(n.node.key.as_slice());
-    //     unsafe {
-    //         let mut curr = pred[0].load_consume(guard);
-
-    //         if curr.tag() == 1 {
-    //             self.cursor = self
-    //                 .list
-    //                 .as_ref()
-    //                 .search_bound(lower_bound, false, guard)
-    //                 .map(|n| Entry::try_acquire(guard, n).unwrap());
-    //             return;
-    //         }
-
-    //         while let Some(c) = curr.as_ref() {
-    //             let succ = c.tower[0].load_consume(guard);
-
-    //             if succ.tag() == 1 {
-    //                 if let Some(c) = self.list.as_ref().help_unlink(&pred[0], c, succ, guard) {
-    //                     // On success, continue searching through the current level.
-    //                     curr = c;
-    //                     continue;
-    //                 } else {
-    //                     // On failure, we cannot do anything reasonable to continue
-    //                     // searching from the current position. Restart the search.
-    //                     self.cursor = self
-    //                         .list
-    //                         .as_ref()
-    //                         .search_bound(lower_bound, false, guard)
-    //                         .map(|n| Entry::try_acquire(guard, n).unwrap());
-    //                     return;
-    //                 }
-    //             }
-
-    //             self.cursor = Some(Entry {
-    //                 node: c,
-    //                 guard: guard,
-    //             });
-    //             return;
-    //         }
-    //     }
-    // }
 
     // pub fn prev(&mut self) {
     //     assert!(self.valid());
@@ -966,12 +936,13 @@ impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'
     // }
 
     pub fn seek(&mut self, target: &[u8], guard: &'g Guard) {
+        self.list.as_ref().check_guard(guard);
         unsafe {
             self.cursor = self
                 .list
                 .as_ref()
                 .search_bound(Bound::Included(target), false, guard)
-                .map(|n| Entry::try_acquire(guard, n));
+                .map(|n| Entry::lifetime_with_guard(n, guard));
         }
     }
 
@@ -985,10 +956,11 @@ impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'
     //     }
     // }
 
-    // pub fn seek_to_first(&mut self) {
-    //     let guard = crossbeam_epoch::pin();
-    //     self.seek_to_first_internal(&guard);
-    // }
+    pub fn seek_to_first(&mut self, guard: &'g Guard) {
+        self.list.as_ref().check_guard(guard);
+        let pred = &self.list.as_ref().inner.head;
+        self.cursor = self.list.as_ref().next_node(pred, Bound::Unbounded, guard);
+    }
 
     // pub fn seek_to_first_internal(&mut self, guard: &Guard) {
     //     let pred = &self.list.as_ref().inner.head;
@@ -1046,6 +1018,7 @@ fn below_upper_bound<C: KeyComparator>(c: &C, bound: &Bound<&[u8]>, key: &[u8]) 
 
 #[cfg(test)]
 mod tests {
+    use core::slice::SlicePattern;
     use std::{collections::HashMap, sync::Mutex};
 
     use super::*;
@@ -1065,19 +1038,19 @@ mod tests {
 
     impl Drop for DummyLimiter {
         fn drop(&mut self) {
-            // let recorder = self.recorder.lock().unwrap();
-            // assert!(recorder.is_empty());
+            let recorder = self.recorder.lock().unwrap();
+            assert!(recorder.is_empty());
         }
     }
 
     impl AllocationRecorder for DummyLimiter {
-        fn alloc(&self, addr: usize, size: usize) {
+        fn allocated(&self, addr: usize, size: usize) {
             let mut recorder = self.recorder.lock().unwrap();
             assert!(!recorder.contains_key(&addr));
             recorder.insert(addr, size);
         }
 
-        fn free(&self, addr: usize, size: usize) {
+        fn freed(&self, addr: usize, size: usize) {
             let mut recorder = self.recorder.lock().unwrap();
             assert_eq!(recorder.remove(&addr).unwrap(), size);
         }
@@ -1111,15 +1084,20 @@ mod tests {
         )
     }
 
-    fn sl_insert(sl: &Skiplist<ByteWiseComparator, DummyLimiter>, k: i32, v: i32, guard: &Guard) {
+    fn sl_insert(
+        sl: &Skiplist<ByteWiseComparator, DummyLimiter>,
+        k: i32,
+        v: i32,
+        guard: &Guard,
+    ) -> bool {
         let k = construct_key(k);
         let v = construct_val(v);
-        sl.put(k, v, guard);
+        sl.put(k, v, guard)
     }
 
-    fn sl_remove(sl: &Skiplist<ByteWiseComparator, DummyLimiter>, k: i32, guard: &Guard) {
+    fn sl_remove(sl: &Skiplist<ByteWiseComparator, DummyLimiter>, k: i32, guard: &Guard) -> bool {
         let k = construct_key(k);
-        sl.remove(&k, guard);
+        sl.remove(&k, guard)
     }
 
     fn sl_get_assert<'a>(
@@ -1132,7 +1110,7 @@ mod tests {
         let res = sl.get(&k, guard);
         if let Some(v) = v {
             let v = construct_val(v);
-            assert_eq!(res.unwrap().node.value, &v);
+            assert_eq!(res.unwrap().value(), &v);
         } else {
             assert!(res.is_none());
         }
@@ -1177,7 +1155,7 @@ mod tests {
 
         let mut v = vec![];
         let mut iter = s.iter(guard);
-        iter.seek(b"", guard);
+        iter.seek_to_first(guard);
         iter.valid();
         while iter.valid() {
             v.push(iter.key().to_vec());
@@ -1195,6 +1173,133 @@ mod tests {
         assert!(s.is_empty());
     }
 
+    fn assert_keys(
+        s: &Skiplist<ByteWiseComparator, DummyLimiter>,
+        expected: Vec<i32>,
+        guard: &Guard,
+    ) {
+        let mut iter = s.iter(guard);
+        iter.seek_to_first(guard);
+        let mut expect_iter = expected.iter();
+        while iter.valid() {
+            let expect_k = construct_key(*expect_iter.next().unwrap());
+            assert_eq!(iter.key().as_slice(), &expect_k);
+            iter.next();
+        }
+        assert!(expect_iter.next().is_none());
+    }
+
     #[test]
-    fn x() {}
+    fn insert_and_remove() {
+        let collector = crossbeam_epoch::Collector::new();
+        let handle = collector.register();
+
+        {
+            let guard = &handle.pin();
+            let s = Skiplist::new(ByteWiseComparator {}, Arc::default(), collector.clone());
+            sl_insert(&s, 3, 0, guard);
+            sl_insert(&s, 5, 0, guard);
+            sl_insert(&s, 1, 0, guard);
+            sl_insert(&s, 4, 0, guard);
+            sl_insert(&s, 2, 0, guard);
+            assert_keys(&s, vec![1, 2, 3, 4, 5], guard);
+
+            assert!(sl_remove(&s, 4, guard));
+            assert_keys(&s, vec![1, 2, 3, 5], guard);
+            assert!(sl_remove(&s, 3, guard));
+            assert_keys(&s, vec![1, 2, 5], guard);
+            assert!(sl_remove(&s, 1, guard));
+            assert_keys(&s, vec![2, 5], guard);
+
+            assert!(!sl_remove(&s, 1, guard));
+            assert_keys(&s, vec![2, 5], guard);
+            assert!(!sl_remove(&s, 3, guard));
+            assert_keys(&s, vec![2, 5], guard);
+
+            assert!(sl_remove(&s, 2, guard));
+            assert_keys(&s, vec![5], guard);
+            assert!(sl_remove(&s, 5, guard));
+            assert_keys(&s, vec![], guard);
+
+            sl_insert(&s, 3, 0, guard);
+            assert_keys(&s, vec![3], guard);
+            sl_insert(&s, 1, 0, guard);
+            assert_keys(&s, vec![1, 3], guard);
+            // overwrite
+            assert!(!sl_insert(&s, 3, 0, guard));
+            assert_keys(&s, vec![1, 3], guard);
+            sl_insert(&s, 5, 0, guard);
+            assert_keys(&s, vec![1, 3, 5], guard);
+
+            assert!(sl_remove(&s, 3, guard));
+            assert_keys(&s, vec![1, 5], guard);
+            assert!(sl_remove(&s, 1, guard));
+            assert_keys(&s, vec![5], guard);
+            assert!(!sl_remove(&s, 3, guard));
+            assert_keys(&s, vec![5], guard);
+            assert!(sl_remove(&s, 5, guard));
+            assert_keys(&s, vec![], guard);
+        }
+    }
+
+    #[test]
+    fn get() {
+        let guard = &crossbeam_epoch::pin();
+        let s = default_list();
+        sl_insert(&s, 30, 3, guard);
+        sl_insert(&s, 50, 5, guard);
+        sl_insert(&s, 10, 1, guard);
+        sl_insert(&s, 40, 4, guard);
+        sl_insert(&s, 20, 2, guard);
+
+        sl_get_assert(&s, 10, Some(1), guard);
+        sl_get_assert(&s, 20, Some(2), guard);
+        sl_get_assert(&s, 30, Some(3), guard);
+        sl_get_assert(&s, 40, Some(4), guard);
+        sl_get_assert(&s, 50, Some(5), guard);
+
+        sl_get_assert(&s, 7, None, guard);
+        sl_get_assert(&s, 27, None, guard);
+        sl_get_assert(&s, 31, None, guard);
+        sl_get_assert(&s, 97, None, guard);
+    }
+
+    #[test]
+    fn iter() {
+        let collector = crossbeam_epoch::Collector::new();
+        let handle = collector.register();
+
+        {
+            let guard = &handle.pin();
+            let s = Skiplist::new(ByteWiseComparator {}, Arc::default(), collector.clone());
+            for &x in &[4, 2] {
+                sl_insert(&s, x, x * 10, guard);
+            }
+
+            assert_keys(&s, vec![2, 4], guard);
+
+            let mut it = s.iter(guard);
+            it.seek_to_first(guard);
+            // `it` is already pointing on 2
+            sl_remove(&s, 2, guard);
+            let k = construct_key(2);
+            assert_eq!(it.key(), &k);
+            // deleting the next key that the iterator would point to makes the iterator skip the key
+            sl_remove(&s, 4, guard);
+            it.next();
+        }
+
+        handle.pin().flush();
+        handle.pin().flush();
+    }
+
+    #[test]
+    fn x() {
+        let mut a = Bytes::new();
+        let mut b = Bytes::from(b"a".to_vec());
+        unsafe {
+            ptr::drop_in_place(&mut a);
+            ptr::drop_in_place(&mut b);
+        }
+    }
 }

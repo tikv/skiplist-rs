@@ -13,9 +13,9 @@ use skiplist_rs::{AllocationRecorder, ByteWiseComparator, MemoryLimiter, Skiplis
 struct DummyLimiter {}
 
 impl AllocationRecorder for DummyLimiter {
-    fn alloc(&self, _: usize, _: usize) {}
+    fn allocated(&self, _: usize, _: usize) {}
 
-    fn free(&self, _: usize, _: usize) {}
+    fn freed(&self, _: usize, _: usize) {}
 }
 
 impl MemoryLimiter for DummyLimiter {

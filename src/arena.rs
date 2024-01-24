@@ -1,8 +1,11 @@
 // Copyright 2023 TiKV Project Authors. Licensed under Apache-2.0.
 
-use std::{alloc::Layout, sync::Arc};
+use std::{alloc::Layout, ptr, sync::Arc};
 
-use crate::list::{MemoryLimiter, ReclaimableNode, U_SIZE};
+use crate::{
+    list::{MemoryLimiter, ReclaimableNode, U_SIZE},
+    Node,
+};
 
 #[derive(Clone)]
 pub struct Arena<M: MemoryLimiter> {
@@ -21,21 +24,23 @@ impl<M: MemoryLimiter> Arena<M> {
 
         let layout = Layout::from_size_align(size, U_SIZE).unwrap();
         let addr = unsafe { std::alloc::alloc(layout) as usize };
-        self.limiter.alloc(addr, size);
+        self.limiter.allocated(addr, size);
         addr
     }
 
-    pub fn free<N: ReclaimableNode>(&self, node_addr: *mut N) {
+    pub fn free(&self, ptr: *const Node) {
+        let ptr = ptr as *mut Node;
         let size = {
-            let node = unsafe { &(*node_addr) };
+            let node = unsafe { &*ptr };
             node.size()
         };
 
-        self.limiter.free(node_addr as usize, size);
+        self.limiter.freed(ptr as usize, size);
         let layout = Layout::from_size_align(size, U_SIZE).unwrap();
         unsafe {
-            (*node_addr).drop_key_value();
-            std::alloc::dealloc(node_addr as *mut u8, layout);
+            ptr::drop_in_place(&mut (*ptr).key);
+            ptr::drop_in_place(&mut (*ptr).value);
+            std::alloc::dealloc(ptr as *mut u8, layout);
         }
         self.limiter.reclaim(size);
     }
