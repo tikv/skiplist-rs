@@ -72,3 +72,13 @@ impl ReadableSize {
         self.0 as f64 / MIB as f64
     }
 }
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Bound<T> {
+    /// An inclusive bound.
+    Included(T),
+    /// An exclusive bound.
+    Excluded(T),
+    /// An infinite endpoint. Indicates that there is no bound in this direction.
+    Unbounded,
+}
