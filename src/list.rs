@@ -1024,12 +1024,12 @@ mod tests {
     use super::*;
     use crate::key::ByteWiseComparator;
 
-    #[cfg(not(target_env = "msvc"))]
-    use tikv_jemallocator::Jemalloc;
+    // #[cfg(not(target_env = "msvc"))]
+    // use tikv_jemallocator::Jemalloc;
 
-    #[cfg(not(target_env = "msvc"))]
-    #[global_allocator]
-    static GLOBAL: Jemalloc = Jemalloc;
+    // #[cfg(not(target_env = "msvc"))]
+    // #[global_allocator]
+    // static GLOBAL: Jemalloc = Jemalloc;
 
     #[derive(Clone, Default)]
     struct DummyLimiter {
@@ -1191,12 +1191,12 @@ mod tests {
 
     #[test]
     fn insert_and_remove() {
-        let collector = crossbeam_epoch::Collector::new();
+        let collector = crossbeam_epoch::default_collector();
         let handle = collector.register();
 
         {
             let guard = &handle.pin();
-            let s = Skiplist::new(ByteWiseComparator {}, Arc::default(), collector.clone());
+            let s = default_list();
             sl_insert(&s, 3, 0, guard);
             sl_insert(&s, 5, 0, guard);
             sl_insert(&s, 1, 0, guard);
@@ -1266,12 +1266,12 @@ mod tests {
 
     #[test]
     fn iter() {
-        let collector = crossbeam_epoch::Collector::new();
+        let collector = crossbeam_epoch::default_collector();
         let handle = collector.register();
 
         {
             let guard = &handle.pin();
-            let s = Skiplist::new(ByteWiseComparator {}, Arc::default(), collector.clone());
+            let s = default_list();
             for &x in &[4, 2] {
                 sl_insert(&s, x, x * 10, guard);
             }
@@ -1291,15 +1291,5 @@ mod tests {
 
         handle.pin().flush();
         handle.pin().flush();
-    }
-
-    #[test]
-    fn x() {
-        let mut a = Bytes::new();
-        let mut b = Bytes::from(b"a".to_vec());
-        unsafe {
-            ptr::drop_in_place(&mut a);
-            ptr::drop_in_place(&mut b);
-        }
     }
 }
