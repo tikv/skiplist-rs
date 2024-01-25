@@ -985,7 +985,7 @@ fn below_upper_bound<C: KeyComparator>(c: &C, bound: &Bound<&[u8]>, key: &[u8]) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{collections::HashMap, sync::Mutex, thread};
 
     use super::*;
@@ -1024,31 +1024,6 @@ mod tests {
     }
 
     impl MemoryLimiter for RecorderLimiter {
-        fn acquire(&self, _: usize) -> bool {
-            true
-        }
-
-        fn mem_usage(&self) -> usize {
-            0
-        }
-
-        fn reclaim(&self, _: usize) {}
-    }
-
-    #[derive(Debug, Clone)]
-    struct DummyLimiter;
-
-    impl Drop for DummyLimiter {
-        fn drop(&mut self) {}
-    }
-
-    impl AllocationRecorder for DummyLimiter {
-        fn allocated(&self, _: usize, _: usize) {}
-
-        fn freed(&self, _: usize, _: usize) {}
-    }
-
-    impl MemoryLimiter for DummyLimiter {
         fn acquire(&self, _: usize) -> bool {
             true
         }
@@ -1262,31 +1237,43 @@ mod tests {
 
     #[test]
     fn iter() {
-        let collector = crossbeam_epoch::default_collector();
-        let handle = collector.register();
-
-        {
-            let guard = &handle.pin();
-            let s = default_list();
-            for &x in &[4, 2] {
-                sl_insert(&s, x, x * 10, guard);
-            }
-
-            assert_keys(&s, vec![2, 4], guard);
-
-            let mut it = s.iter(guard);
-            it.seek_to_first(guard);
-            // `it` is already pointing on 2
-            sl_remove(&s, 2, guard);
-            let k = construct_key(2);
-            assert_eq!(it.key(), &k);
-            // deleting the next key that the iterator would point to makes the iterator skip the key
-            sl_remove(&s, 4, guard);
-            it.next();
+        let guard = &crossbeam_epoch::pin();
+        let s = default_list();
+        for &x in &[4, 2, 12, 8, 7, 11, 5] {
+            sl_insert(&s, x, x * 10, guard);
         }
 
-        handle.pin().flush();
-        handle.pin().flush();
+        assert_keys(&s, vec![2, 4, 5, 7, 8, 11, 12], guard);
+
+        let mut it = s.iter(guard);
+        it.seek_to_first(guard);
+        // `it` is already pointing on 2
+        sl_remove(&s, 2, guard);
+        let k = construct_key(2);
+        assert_eq!(it.key(), &k);
+        // init another iter (it2), `it2` should not read `2`
+        let mut it2 = s.iter(guard);
+        it2.seek_to_first(guard);
+        assert_ne!(it2.key(), &k);
+
+        // deleting the next key that the iterator would point to makes the iterator skip the key
+        sl_remove(&s, 4, guard);
+        it.next();
+        let k = construct_key(5);
+        assert_eq!(it.key(), &k);
+
+        sl_remove(&s, 8, guard);
+        it.next();
+        let k = construct_key(7);
+        assert_eq!(it.key(), &k);
+
+        sl_remove(&s, 12, guard);
+        it.next();
+        let k = construct_key(11);
+        assert_eq!(it.key(), &k);
+
+        it.next();
+        assert!(!it.valid());
     }
 
     #[test]
@@ -1339,39 +1326,66 @@ mod tests {
 
     #[test]
     fn concurrent_put_and_remove() {
-        let sl = default_list();
-        let n = 100000;
-        for i in (0..n).step_by(2) {
-            let guard = &crossbeam_epoch::pin();
-            let k = format!("k{:04}", i).into_bytes();
-            let v = format!("v{:04}", i).into_bytes();
-            sl.put(k, v, guard);
-        }
-        let sl1 = sl.clone();
-        let h1 = thread::spawn(move || {
-            for i in (1..n).step_by(2) {
+        for _ in 0..5 {
+            let sl = Skiplist::<ByteWiseComparator, RecorderLimiter>::new(
+                ByteWiseComparator {},
+                Arc::default(),
+                crossbeam_epoch::default_collector().clone(),
+            );
+            let n = 50000;
+            for i in (0..n).step_by(3) {
                 let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i).into_bytes();
                 let v = format!("v{:04}", i).into_bytes();
-                sl1.put(k, v, guard);
+                sl.put(k, v, guard);
             }
-        });
-        let sl1 = sl.clone();
-        let h2 = thread::spawn(move || {
-            for i in (0..n).step_by(2) {
+            let sl1 = sl.clone();
+            let h1 = thread::spawn(move || {
+                for i in (1..n).step_by(3) {
+                    let guard = &crossbeam_epoch::pin();
+                    let k = format!("k{:04}", i).into_bytes();
+                    let v = format!("v{:04}", i).into_bytes();
+                    sl1.put(k, v, guard);
+                }
+            });
+            let sl1 = sl.clone();
+            let h2 = thread::spawn(move || {
+                for i in (0..n).step_by(3) {
+                    let guard = &crossbeam_epoch::pin();
+                    let k = format!("k{:04}", i);
+                    sl1.remove(k.as_bytes(), guard);
+                }
+            });
+
+            let sl1 = sl.clone();
+            let h3 = thread::spawn(move || {
+                for i in (0..n).step_by(3) {
+                    let guard = &crossbeam_epoch::pin();
+                    let k = format!("k{:04}", i);
+                    sl1.remove(k.as_bytes(), guard);
+                }
+            });
+
+            let sl1 = sl.clone();
+            let h4 = thread::spawn(move || {
+                for i in (2..n).step_by(3) {
+                    let guard = &crossbeam_epoch::pin();
+                    let k = format!("k{:04}", i);
+                    sl1.remove(k.as_bytes(), guard);
+                }
+            });
+
+            h1.join().unwrap();
+            h2.join().unwrap();
+            h3.join().unwrap();
+            h4.join().unwrap();
+
+            for i in (1..n).step_by(3) {
                 let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i);
-                sl1.remove(k.as_bytes(), guard);
+                let v = format!("v{:04}", i);
+                assert_eq!(sl.get(k.as_bytes(), guard).unwrap().value(), v.as_bytes());
             }
-        });
-        h1.join().unwrap();
-        h2.join().unwrap();
-
-        for i in (1..n).step_by(2) {
-            let guard = &crossbeam_epoch::pin();
-            let k = format!("k{:04}", i);
-            let v = format!("v{:04}", i);
-            assert_eq!(sl.get(k.as_bytes(), guard).unwrap().value(), v.as_bytes());
         }
     }
 }

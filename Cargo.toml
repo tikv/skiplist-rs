@@ -18,6 +18,9 @@ bytes = "1"
 rand = "0.8.4"
 slog = "2.2"
 
+[dev-dependencies]
+loom = "0.7"
+
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.5"
 
