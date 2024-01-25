@@ -11,7 +11,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use crossbeam_epoch::{self, Collector, Guard, Shared};
+use crossbeam_epoch::{self, pin, Collector, Guard, Shared};
 use crossbeam_utils::cache_padded::CachePadded;
 
 use crossbeam_epoch::Atomic;
@@ -202,16 +202,53 @@ impl Node {
         true
     }
 
+    /// Attempts to increment the reference count of a node and returns `true` on success.
+    ///
+    /// The reference count can be incremented only if it is non-zero.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reference count overflows.
+    #[inline]
+    unsafe fn try_increment(&self) -> bool {
+        let mut refs_and_height = self.refs_and_height.load(Ordering::Relaxed);
+
+        loop {
+            // If the reference count is zero, then the node has already been
+            // queued for deletion. Incrementing it again could lead to a
+            // double-free.
+            if refs_and_height & !HEIGHT_MASK == 0 {
+                return false;
+            }
+
+            // If all bits in the reference count are ones, we're about to overflow it.
+            let new_refs_and_height = refs_and_height
+                .checked_add(1 << HEIGHT_BITS)
+                .expect("SkipList reference count overflow");
+
+            // Try incrementing the count.
+            match self.refs_and_height.compare_exchange_weak(
+                refs_and_height,
+                new_refs_and_height,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => refs_and_height = current,
+            }
+        }
+    }
+
     /// Decrements the reference count of a node, destroying it if the count becomes zero.
     #[inline]
-    unsafe fn decrement<M: MemoryLimiter>(&self, guard: &Guard, arena: Arena<M>) {
+    unsafe fn decrement<M: MemoryLimiter>(&self, arena: Arena<M>) {
         let current_ref = self
             .refs_and_height
             .fetch_sub(1 << HEIGHT_BITS, Ordering::Release)
             >> HEIGHT_BITS;
         if current_ref == 1 {
             fence(Ordering::Acquire);
-            guard.defer(move || Self::finalize(self, &arena));
+            Self::finalize(self, &arena);
         }
     }
 
@@ -243,25 +280,6 @@ struct SkiplistInner<M: MemoryLimiter> {
     /// <emory management unit
     arena: Arena<M>,
 }
-
-// impl<M: MemoryLimiter> SkiplistInner<M> {
-//     pub fn print(&self) {
-//         println!("print the skiplist");
-//         unsafe {
-//             for i in (0..=self.height.load(Ordering::Relaxed)).rev() {
-//                 let mut node_off = self.head.as_ref().tower[i].load(Ordering::Relaxed);
-
-//                 print!("level {}", i);
-//                 while node_off != 0 {
-//                     let node: *mut Node = self.arena.get_mut(node_off);
-//                     print!("  {:?} -->", (*node).key);
-//                     node_off = (*node).tower[i].load(Ordering::Relaxed);
-//                 }
-//                 println!()
-//             }
-//         }
-//     }
-// }
 
 unsafe impl<M: MemoryLimiter> Send for SkiplistInner<M> {}
 unsafe impl<M: MemoryLimiter> Sync for SkiplistInner<M> {}
@@ -369,7 +387,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             guard,
         ) {
             Ok(_) => {
-                curr.decrement(guard, self.inner.arena.clone());
+                curr.decrement(self.inner.arena.clone());
                 Some(succ.with_tag(0))
             }
             Err(_) => None,
@@ -565,7 +583,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                             .is_ok()
                         {
                             // Success! Decrement the reference count.
-                            n.decrement(guard, self.inner.arena.clone());
+                            n.decrement(self.inner.arena.clone());
                         } else {
                             self.search_bound(Bound::Included(key), false, guard);
                             break;
@@ -703,11 +721,12 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         true
     }
 
-    pub fn get<'a>(&self, key: &[u8], guard: &'a Guard) -> Option<Entry<'a>> {
+    pub fn get<'a>(&self, key: &[u8], guard: &'a Guard) -> Option<Entry<M>> {
         self.check_guard(guard);
         if let Some(n) = unsafe { self.search_bound(Bound::Included(key), false, guard) } {
             if self.c.same_key(&n.key, key) {
-                return Some(unsafe { Entry::new(n, guard) });
+                // todo
+                return Some(unsafe { Entry::try_acquire(n, self.inner.arena.clone()).unwrap() });
             }
         }
 
@@ -719,7 +738,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         pred: &Tower,
         lower_bound: Bound<&[u8]>,
         guard: &'a Guard,
-    ) -> Option<&'a Node> {
+    ) -> Option<Entry<M>> {
         unsafe {
             // Load the level 0 successor of the current node.
             let mut curr = pred[0].load_consume(guard);
@@ -729,7 +748,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
             if curr.tag() == 1 {
                 return self
                     .search_bound(lower_bound, false, guard)
-                    .map(|n| Entry::lifetime_with_guard(n, guard));
+                    // todo
+                    .map(|n| Entry::try_acquire(n, self.inner.arena.clone()).unwrap());
             }
 
             while let Some(c) = curr.as_ref() {
@@ -745,31 +765,22 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                         // searching from the current position. Restart the search.
                         return self
                             .search_bound(lower_bound, false, guard)
-                            .map(|n| Entry::lifetime_with_guard(n, guard));
+                            // todo
+                            .map(|n| Entry::try_acquire(n, self.inner.arena.clone()).unwrap());
                     }
                 }
 
-                return Some(Entry::lifetime_with_guard(c, guard));
+                return Some(Entry::try_acquire(c, self.inner.arena.clone()).unwrap());
             }
 
             None
         }
     }
 
-    // pub fn iter_ref(&self) -> IterRef<&Skiplist<C, M>, C, M> {
-    //     IterRef {
-    //         list: self,
-    //         cursor: NodeWrap(ptr::null()),
-    //         _key_cmp: std::marker::PhantomData,
-    //         _limiter: std::marker::PhantomData,
-    //     }
-    // }
-
-    pub fn iter<'a>(&self, guard: &'a Guard) -> IterRef<'a, Skiplist<C, M>, C, M> {
+    pub fn iter<'a>(&self) -> IterRef<Skiplist<C, M>, C, M> {
         IterRef {
             list: self.clone(),
             cursor: None,
-            guard,
             _key_cmp: std::marker::PhantomData,
             _limiter: std::marker::PhantomData,
         }
@@ -817,45 +828,56 @@ unsafe impl<C: Sync + KeyComparator, M: MemoryLimiter> Sync for Skiplist<C, M> {
 ///
 /// The lifetimes of the key and value are the same as that of the `Guard`
 /// used when creating the `Entry` (`'g`).
-pub struct Entry<'g> {
-    node: &'g Node,
+pub struct Entry<M: MemoryLimiter> {
+    node: *const Node,
+    arena: Arena<M>,
 }
 
-impl<'g> Entry<'g> {
-    unsafe fn new(node: &Node, _: &'g Guard) -> Self {
-        Self {
-            node: &*(node as *const _),
+impl<M: MemoryLimiter> Drop for Entry<M> {
+    fn drop(&mut self) {
+        unsafe { (*self.node).decrement(self.arena.clone()) }
+    }
+}
+
+impl<M: MemoryLimiter> Entry<M> {
+    unsafe fn try_acquire(node: &Node, arena: Arena<M>) -> Option<Entry<M>> {
+        if node.try_increment() {
+            Some(Entry {
+                node: node as *const _,
+                arena,
+            })
+        } else {
+            None
         }
     }
 
-    unsafe fn lifetime_with_guard(node: &Node, _: &'g Guard) -> &'g Node {
-        &*(node as *const _)
+    pub fn key(&self) -> &Bytes {
+        unsafe { &(*self.node).key }
     }
 
     pub fn value(&self) -> &Bytes {
-        &self.node.value
+        unsafe { &(*self.node).value }
     }
 }
 
-pub struct IterRef<'g, T, C: KeyComparator, M: MemoryLimiter>
+pub struct IterRef<T, C: KeyComparator, M: MemoryLimiter>
 where
     T: AsRef<Skiplist<C, M>>,
 {
     list: T,
-    cursor: Option<&'g Node>,
-    guard: &'g Guard,
+    cursor: Option<Entry<M>>,
     _key_cmp: std::marker::PhantomData<C>,
     _limiter: std::marker::PhantomData<M>,
 }
 
-impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'g, T, C, M> {
+impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C, M> {
     pub fn valid(&self) -> bool {
         self.cursor.is_some()
     }
 
     pub fn key(&self) -> &Bytes {
         assert!(self.valid());
-        &(&**self.cursor.as_ref().unwrap()).key
+        self.cursor.as_ref().unwrap().key()
     }
 
     pub fn value(&self) -> &Bytes {
@@ -866,50 +888,61 @@ impl<'g, T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<'
 
     pub fn next(&mut self) {
         assert!(self.valid());
-        self.cursor = match self.cursor {
-            Some(n) => self
-                .list
-                .as_ref()
-                .next_node(&n.tower, Bound::Excluded(&n.key), self.guard),
+        let guard = &pin();
+        self.cursor = match &self.cursor {
+            Some(n) => self.list.as_ref().next_node(
+                unsafe { &(*n.node).tower },
+                Bound::Excluded(n.key()),
+                guard,
+            ),
             None => unreachable!(),
         }
     }
 
     pub fn prev(&mut self) {
         assert!(self.valid());
+        let guard = &pin();
         unsafe {
-            self.cursor = match self.cursor {
+            self.cursor = match &self.cursor {
                 Some(n) => self
                     .list
                     .as_ref()
-                    .search_bound(Bound::Excluded(&n.key), true, self.guard)
-                    .map(|n| Entry::lifetime_with_guard(n, self.guard)),
+                    .search_bound(Bound::Excluded(n.key()), true, guard)
+                    // todo
+                    .map(|n| {
+                        Entry::try_acquire(n, self.list.as_ref().inner.arena.clone()).unwrap()
+                    }),
                 None => None,
             };
         }
     }
 
     pub fn seek(&mut self, target: &[u8]) {
+        let guard = &pin();
         unsafe {
             self.cursor = self
                 .list
                 .as_ref()
-                .search_bound(Bound::Included(target), false, self.guard)
-                .map(|n| Entry::lifetime_with_guard(n, self.guard));
+                .search_bound(Bound::Included(target), false, guard)
+                // todo
+                .map(|n| Entry::try_acquire(n, self.list.as_ref().inner.arena.clone()).unwrap());
         }
     }
 
     pub fn seek_for_prev(&mut self, target: &[u8]) {
+        let guard = &pin();
         unsafe {
             self.cursor = self
                 .list
                 .as_ref()
-                .search_bound(Bound::Included(target), true, self.guard)
-                .map(|n| Entry::lifetime_with_guard(n, self.guard));
+                .search_bound(Bound::Included(target), true, guard)
+                // todo
+                .map(|n| Entry::try_acquire(n, self.list.as_ref().inner.arena.clone()).unwrap());
         }
     }
 
-    pub fn seek_to_first(&mut self, guard: &'g Guard) {
+    pub fn seek_to_first(&mut self) {
+        let guard = &pin();
         self.list.as_ref().check_guard(guard);
         let pred = &self.list.as_ref().inner.head;
         self.cursor = self.list.as_ref().next_node(pred, Bound::Unbounded, guard);
@@ -1044,8 +1077,8 @@ pub(crate) mod tests {
         }
 
         let mut v = vec![];
-        let mut iter = s.iter(guard);
-        iter.seek_to_first(guard);
+        let mut iter = s.iter();
+        iter.seek_to_first();
         iter.valid();
         while iter.valid() {
             v.push(iter.key().to_vec());
@@ -1066,10 +1099,10 @@ pub(crate) mod tests {
     fn assert_keys(
         s: &Skiplist<ByteWiseComparator, RecorderLimiter>,
         expected: Vec<i32>,
-        guard: &Guard,
+        _guard: &Guard,
     ) {
-        let mut iter = s.iter(guard);
-        iter.seek_to_first(guard);
+        let mut iter = s.iter();
+        iter.seek_to_first();
         let mut expect_iter = expected.iter();
         while iter.valid() {
             let expect_k = construct_key(*expect_iter.next().unwrap());
@@ -1164,15 +1197,15 @@ pub(crate) mod tests {
 
         assert_keys(&s, vec![2, 4, 5, 7, 8, 11, 12], guard);
 
-        let mut it = s.iter(guard);
-        it.seek_to_first(guard);
+        let mut it = s.iter();
+        it.seek_to_first();
         // `it` is already pointing on 2
         sl_remove(&s, 2, guard);
         let k = construct_key(2);
         assert_eq!(it.key(), &k);
         // init another iter (it2), `it2` should not read `2`
-        let mut it2 = s.iter(guard);
-        it2.seek_to_first(guard);
+        let mut it2 = s.iter();
+        it2.seek_to_first();
         assert_ne!(it2.key(), &k);
 
         // deleting the next key that the iterator would point to makes the iterator skip the key
@@ -1205,7 +1238,7 @@ pub(crate) mod tests {
             sl_insert(&s, i, i * 10, guard);
         }
 
-        let mut iter = s.iter(guard);
+        let mut iter = s.iter();
         let k = construct_key(3);
         iter.seek(&k);
         let expected_k = construct_key(4);
@@ -1230,8 +1263,8 @@ pub(crate) mod tests {
             sl_insert(&s, i, i * 10, guard);
         }
 
-        let mut iter = s.iter(guard);
-        let mut iter2 = s.iter(guard);
+        let mut iter = s.iter();
+        let mut iter2 = s.iter();
         let k = construct_key(20);
         iter.seek_for_prev(&k);
         for &i in [0, 2, 4, 5, 7, 8, 11, 12].iter().rev() {
