@@ -824,6 +824,8 @@ impl<M: MemoryLimiter> Drop for SkiplistInner<M> {
 unsafe impl<C: Send + KeyComparator, M: MemoryLimiter> Send for Skiplist<C, M> {}
 unsafe impl<C: Sync + KeyComparator, M: MemoryLimiter> Sync for Skiplist<C, M> {}
 
+unsafe impl<M: MemoryLimiter> Send for Entry<M> {}
+
 /// An entry in a skip list, protected by a `Guard`.
 ///
 /// The lifetimes of the key and value are the same as that of the `Guard`
