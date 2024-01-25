@@ -1,47 +1,7 @@
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 use loom::thread;
-use skiplist_rs::{AllocationRecorder, ByteWiseComparator, MemoryLimiter, Skiplist};
-
-#[derive(Clone, Default)]
-struct RecorderLimiter {
-    recorder: Arc<Mutex<HashMap<usize, usize>>>,
-}
-
-impl Drop for RecorderLimiter {
-    fn drop(&mut self) {
-        let recorder = self.recorder.lock().unwrap();
-        assert!(recorder.is_empty());
-    }
-}
-
-impl AllocationRecorder for RecorderLimiter {
-    fn allocated(&self, addr: usize, size: usize) {
-        let mut recorder = self.recorder.lock().unwrap();
-        assert!(!recorder.contains_key(&addr));
-        recorder.insert(addr, size);
-    }
-
-    fn freed(&self, addr: usize, size: usize) {
-        let mut recorder = self.recorder.lock().unwrap();
-        assert_eq!(recorder.remove(&addr).unwrap(), size);
-    }
-}
-
-impl MemoryLimiter for RecorderLimiter {
-    fn acquire(&self, _: usize) -> bool {
-        true
-    }
-
-    fn mem_usage(&self) -> usize {
-        0
-    }
-
-    fn reclaim(&self, _: usize) {}
-}
+use skiplist_rs::{ByteWiseComparator, RecorderLimiter, Skiplist};
 
 #[test]
 fn concurrent_put_and_remove() {

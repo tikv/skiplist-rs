@@ -16,7 +16,7 @@ use crossbeam_utils::cache_padded::CachePadded;
 
 use crossbeam_epoch::Atomic;
 
-use crate::Bound;
+use crate::{Bound, MemoryLimiter};
 
 use super::{arena::Arena, KeyComparator};
 
@@ -136,19 +136,6 @@ impl ReclaimableNode for Node {
     }
 }
 
-pub trait MemoryLimiter: AllocationRecorder {
-    fn acquire(&self, n: usize) -> bool;
-    fn reclaim(&self, n: usize);
-    fn mem_usage(&self) -> usize;
-}
-
-// todo(SpadeA): This is used for the purpose of recording the memory footprint.
-// It should be removed in the future.
-pub trait AllocationRecorder: Clone {
-    fn allocated(&self, addr: usize, size: usize);
-    fn freed(&self, addr: usize, size: usize);
-}
-
 impl Node {
     fn alloc<M: MemoryLimiter>(
         arena: &Arena<M>,
@@ -213,37 +200,6 @@ impl Node {
 
         // We marked the level 0 pointer, therefore we removed the node.
         true
-    }
-
-    #[allow(dead_code)]
-    #[inline]
-    unsafe fn try_increment(&self) -> bool {
-        let mut refs_and_height = self.refs_and_height.load(Ordering::Relaxed);
-
-        loop {
-            // If the reference count is zero, then the node has already been
-            // queued for deletion. Incrementing it again could lead to a
-            // double-free.
-            if refs_and_height & !HEIGHT_MASK == 0 {
-                return false;
-            }
-
-            // If all bits in the reference count are ones, we're about to overflow it.
-            let new_refs_and_height = refs_and_height
-                .checked_add(1 << HEIGHT_BITS)
-                .expect("SkipList reference count overflow");
-
-            // Try incrementing the count.
-            match self.refs_and_height.compare_exchange_weak(
-                refs_and_height,
-                new_refs_and_height,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return true,
-                Err(current) => refs_and_height = current,
-            }
-        }
     }
 
     /// Decrements the reference count of a node, destroying it if the count becomes zero.
@@ -986,10 +942,10 @@ fn below_upper_bound<C: KeyComparator>(c: &C, bound: &Bound<&[u8]>, key: &[u8]) 
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{collections::HashMap, sync::Mutex, thread};
+    use std::thread;
 
     use super::*;
-    use crate::key::ByteWiseComparator;
+    use crate::{key::ByteWiseComparator, memory_control::RecorderLimiter};
 
     #[cfg(not(target_env = "msvc"))]
     use tikv_jemallocator::Jemalloc;
@@ -997,43 +953,6 @@ pub(crate) mod tests {
     #[cfg(not(target_env = "msvc"))]
     #[global_allocator]
     static GLOBAL: Jemalloc = Jemalloc;
-
-    #[derive(Clone, Default)]
-    struct RecorderLimiter {
-        recorder: Arc<Mutex<HashMap<usize, usize>>>,
-    }
-
-    impl Drop for RecorderLimiter {
-        fn drop(&mut self) {
-            let recorder = self.recorder.lock().unwrap();
-            assert!(recorder.is_empty());
-        }
-    }
-
-    impl AllocationRecorder for RecorderLimiter {
-        fn allocated(&self, addr: usize, size: usize) {
-            let mut recorder = self.recorder.lock().unwrap();
-            assert!(!recorder.contains_key(&addr));
-            recorder.insert(addr, size);
-        }
-
-        fn freed(&self, addr: usize, size: usize) {
-            let mut recorder = self.recorder.lock().unwrap();
-            assert_eq!(recorder.remove(&addr).unwrap(), size);
-        }
-    }
-
-    impl MemoryLimiter for RecorderLimiter {
-        fn acquire(&self, _: usize) -> bool {
-            true
-        }
-
-        fn mem_usage(&self) -> usize {
-            0
-        }
-
-        fn reclaim(&self, _: usize) {}
-    }
 
     fn construct_key(i: i32) -> Vec<u8> {
         format!("key-{:08}", i).into_bytes()

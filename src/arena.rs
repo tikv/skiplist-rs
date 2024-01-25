@@ -3,7 +3,8 @@
 use std::{alloc::Layout, ptr, sync::Arc};
 
 use crate::{
-    list::{MemoryLimiter, ReclaimableNode, U_SIZE},
+    list::{ReclaimableNode, U_SIZE},
+    memory_control::MemoryLimiter,
     Node,
 };
 

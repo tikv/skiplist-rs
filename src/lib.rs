@@ -6,9 +6,11 @@
 mod arena;
 mod key;
 mod list;
+mod memory_control;
 
 pub use key::{ByteWiseComparator, FixedLengthSuffixComparator, KeyComparator};
-pub use list::{AllocationRecorder, IterRef, MemoryLimiter, Node, Skiplist};
+pub use list::{IterRef, Node, Skiplist};
+pub use memory_control::{AllocationRecorder, MemoryLimiter, RecorderLimiter};
 
 use tikv_jemalloc_ctl::{epoch, stats, Error};
 
