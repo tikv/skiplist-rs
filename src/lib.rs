@@ -6,11 +6,11 @@
 mod arena;
 mod key;
 mod list;
-
-const MAX_HEIGHT: usize = 20;
+mod memory_control;
 
 pub use key::{ByteWiseComparator, FixedLengthSuffixComparator, KeyComparator};
-pub use list::{AllocationRecorder, IterRef, MemoryLimiter, Node, Skiplist, MAX_NODE_SIZE};
+pub use list::{IterRef, Node, Skiplist};
+pub use memory_control::{AllocationRecorder, MemoryLimiter, RecorderLimiter};
 
 use tikv_jemalloc_ctl::{epoch, stats, Error};
 
@@ -71,4 +71,14 @@ impl ReadableSize {
     pub fn as_mb_f64(self) -> f64 {
         self.0 as f64 / MIB as f64
     }
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Bound<T> {
+    /// An inclusive bound.
+    Included(T),
+    /// An exclusive bound.
+    Excluded(T),
+    /// An infinite endpoint. Indicates that there is no bound in this direction.
+    Unbounded,
 }
