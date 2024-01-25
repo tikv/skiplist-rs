@@ -723,7 +723,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         true
     }
 
-    pub fn get<'a>(&self, key: &[u8], guard: &'a Guard) -> Option<Entry<M>> {
+    pub fn get<'a>(&self, key: &[u8]) -> Option<Entry<M>> {
+        let guard = &crossbeam_epoch::pin();
         self.check_guard(guard);
         if let Some(n) = unsafe { self.search_bound(Bound::Included(key), false, guard) } {
             if self.c.same_key(&n.key, key) {
@@ -1034,7 +1035,7 @@ pub(crate) mod tests {
         guard: &Guard,
     ) {
         let k = construct_key(k);
-        let res = sl.get(&k, guard);
+        let res = sl.get(&k);
         if let Some(v) = v {
             let v = construct_val(v);
             assert_eq!(res.unwrap().value(), &v);
@@ -1340,7 +1341,7 @@ pub(crate) mod tests {
                 let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i);
                 let v = format!("v{:04}", i);
-                assert_eq!(sl.get(k.as_bytes(), guard).unwrap().value(), v.as_bytes());
+                assert_eq!(sl.get(k.as_bytes()).unwrap().value(), v.as_bytes());
             }
         }
     }
