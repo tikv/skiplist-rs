@@ -7,10 +7,8 @@ mod arena;
 mod key;
 mod list;
 
-const MAX_HEIGHT: usize = 20;
-
 pub use key::{ByteWiseComparator, FixedLengthSuffixComparator, KeyComparator};
-pub use list::{AllocationRecorder, IterRef, MemoryLimiter, Node, Skiplist, MAX_NODE_SIZE};
+pub use list::{AllocationRecorder, IterRef, MemoryLimiter, Node, Skiplist};
 
 use tikv_jemalloc_ctl::{epoch, stats, Error};
 

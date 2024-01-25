@@ -38,8 +38,12 @@ impl<M: MemoryLimiter> Arena<M> {
         self.limiter.freed(ptr as usize, size);
         let layout = Layout::from_size_align(size, U_SIZE).unwrap();
         unsafe {
-            ptr::drop_in_place(&mut (*ptr).key);
-            ptr::drop_in_place(&mut (*ptr).value);
+            if !(*ptr).key.is_empty() {
+                ptr::drop_in_place(&mut (*ptr).key);
+            }
+            if !(*ptr).value.is_empty() {
+                ptr::drop_in_place(&mut (*ptr).value);
+            }
             std::alloc::dealloc(ptr as *mut u8, layout);
         }
         self.limiter.reclaim(size);
