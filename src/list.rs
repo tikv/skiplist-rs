@@ -551,7 +551,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    pub fn remove(&self, key: &[u8], guard: &Guard) -> bool {
+    pub fn remove(&self, key: &[u8]) -> bool {
+        let guard = &crossbeam_epoch::pin();
         self.check_guard(guard);
 
         unsafe {
@@ -596,7 +597,8 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
         }
     }
 
-    pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>, guard: &Guard) -> bool {
+    pub fn put(&self, key: impl Into<Bytes>, value: impl Into<Bytes>) -> bool {
+        let guard = &crossbeam_epoch::pin();
         let (key, value) = (key.into(), value.into());
         self.check_guard(guard);
 
@@ -1013,7 +1015,7 @@ pub(crate) mod tests {
     ) -> bool {
         let k = construct_key(k);
         let v = construct_val(v);
-        sl.put(k, v, guard)
+        sl.put(k, v)
     }
 
     fn sl_remove(
@@ -1022,7 +1024,7 @@ pub(crate) mod tests {
         guard: &Guard,
     ) -> bool {
         let k = construct_key(k);
-        sl.remove(&k, guard)
+        sl.remove(&k)
     }
 
     fn sl_get_assert<'a>(
@@ -1291,7 +1293,7 @@ pub(crate) mod tests {
                 let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i).into_bytes();
                 let v = format!("v{:04}", i).into_bytes();
-                sl.put(k, v, guard);
+                sl.put(k, v);
             }
             let sl1 = sl.clone();
             let h1 = thread::spawn(move || {
@@ -1299,7 +1301,7 @@ pub(crate) mod tests {
                     let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i).into_bytes();
                     let v = format!("v{:04}", i).into_bytes();
-                    sl1.put(k, v, guard);
+                    sl1.put(k, v);
                 }
             });
             let sl1 = sl.clone();
@@ -1307,7 +1309,7 @@ pub(crate) mod tests {
                 for i in (0..n).step_by(3) {
                     let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
-                    sl1.remove(k.as_bytes(), guard);
+                    sl1.remove(k.as_bytes());
                 }
             });
 
@@ -1316,7 +1318,7 @@ pub(crate) mod tests {
                 for i in (0..n).step_by(3) {
                     let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
-                    sl1.remove(k.as_bytes(), guard);
+                    sl1.remove(k.as_bytes());
                 }
             });
 
@@ -1325,7 +1327,7 @@ pub(crate) mod tests {
                 for i in (2..n).step_by(3) {
                     let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
-                    sl1.remove(k.as_bytes(), guard);
+                    sl1.remove(k.as_bytes());
                 }
             });
 
