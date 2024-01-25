@@ -887,8 +887,7 @@ impl<T: AsRef<Skiplist<C, M>>, C: KeyComparator, M: MemoryLimiter> IterRef<T, C,
 
     pub fn value(&self) -> &Bytes {
         assert!(self.valid());
-        // &self.cursor.as_ref().unwrap().value
-        unimplemented!()
+        self.cursor.as_ref().unwrap().value()
     }
 
     pub fn next(&mut self) {
