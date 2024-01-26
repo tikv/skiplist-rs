@@ -37,7 +37,6 @@ fn construct_key(i: u64) -> Vec<u8> {
 #[bench]
 fn insert(b: &mut Bencher) {
     b.iter(|| {
-        let guard = &crossbeam_epoch::pin();
         let map = Skiplist::new(
             ByteWiseComparator {},
             Arc::new(DummyLimiter::default()),
@@ -47,7 +46,9 @@ fn insert(b: &mut Bencher) {
         let mut num = 0 as u64;
         for _ in 0..1_000 {
             num = num.wrapping_mul(17).wrapping_add(255);
-            map.put(construct_key(num), construct_key(!num), guard);
+            let k = construct_key(num);
+            map.put(k.clone(), construct_key(!num));
+            map.get(&k);
         }
     });
 }

@@ -1007,22 +1007,13 @@ pub(crate) mod tests {
         )
     }
 
-    fn sl_insert(
-        sl: &Skiplist<ByteWiseComparator, RecorderLimiter>,
-        k: i32,
-        v: i32,
-        guard: &Guard,
-    ) -> bool {
+    fn sl_insert(sl: &Skiplist<ByteWiseComparator, RecorderLimiter>, k: i32, v: i32) -> bool {
         let k = construct_key(k);
         let v = construct_val(v);
         sl.put(k, v)
     }
 
-    fn sl_remove(
-        sl: &Skiplist<ByteWiseComparator, RecorderLimiter>,
-        k: i32,
-        guard: &Guard,
-    ) -> bool {
+    fn sl_remove(sl: &Skiplist<ByteWiseComparator, RecorderLimiter>, k: i32) -> bool {
         let k = construct_key(k);
         sl.remove(&k)
     }
@@ -1031,7 +1022,6 @@ pub(crate) mod tests {
         sl: &'a Skiplist<ByteWiseComparator, RecorderLimiter>,
         k: i32,
         v: Option<i32>,
-        guard: &Guard,
     ) {
         let k = construct_key(k);
         let res = sl.get(&k);
@@ -1049,20 +1039,18 @@ pub(crate) mod tests {
         let not_present = [1, 3, 6, 9, 10];
         let s = default_list();
 
-        let guard = &crossbeam_epoch::pin();
         for i in insert {
-            sl_insert(&s, i, i * 10, guard);
-            sl_get_assert(&s, i, Some(i * 10), guard);
+            sl_insert(&s, i, i * 10);
+            sl_get_assert(&s, i, Some(i * 10));
         }
 
         for i in not_present {
-            sl_get_assert(&s, i, None, guard);
+            sl_get_assert(&s, i, None);
         }
     }
 
     #[test]
     fn remove() {
-        let guard = &crossbeam_epoch::pin();
         let insert = [0, 4, 2, 12, 8, 7, 11, 5];
         let not_present = [1, 3, 6, 9, 10];
         let remove = [2, 12, 8];
@@ -1071,13 +1059,13 @@ pub(crate) mod tests {
         let s = default_list();
 
         for &x in &insert {
-            sl_insert(&s, x, x * 10, guard);
+            sl_insert(&s, x, x * 10);
         }
         for &x in &not_present {
-            sl_remove(&s, x, guard);
+            sl_remove(&s, x);
         }
         for &x in &remove {
-            sl_remove(&s, x, guard);
+            sl_remove(&s, x);
         }
 
         let mut v = vec![];
@@ -1095,7 +1083,7 @@ pub(crate) mod tests {
         }
 
         for &x in &insert {
-            sl_remove(&s, x, guard);
+            sl_remove(&s, x);
         }
         assert!(s.is_empty());
     }
@@ -1124,71 +1112,70 @@ pub(crate) mod tests {
         {
             let guard = &handle.pin();
             let s = default_list();
-            sl_insert(&s, 3, 0, guard);
-            sl_insert(&s, 5, 0, guard);
-            sl_insert(&s, 1, 0, guard);
-            sl_insert(&s, 4, 0, guard);
-            sl_insert(&s, 2, 0, guard);
+            sl_insert(&s, 3, 0);
+            sl_insert(&s, 5, 0);
+            sl_insert(&s, 1, 0);
+            sl_insert(&s, 4, 0);
+            sl_insert(&s, 2, 0);
             assert_keys(&s, vec![1, 2, 3, 4, 5], guard);
 
-            assert!(sl_remove(&s, 4, guard));
+            assert!(sl_remove(&s, 4));
             assert_keys(&s, vec![1, 2, 3, 5], guard);
-            assert!(sl_remove(&s, 3, guard));
+            assert!(sl_remove(&s, 3));
             assert_keys(&s, vec![1, 2, 5], guard);
-            assert!(sl_remove(&s, 1, guard));
+            assert!(sl_remove(&s, 1));
             assert_keys(&s, vec![2, 5], guard);
 
-            assert!(!sl_remove(&s, 1, guard));
+            assert!(!sl_remove(&s, 1));
             assert_keys(&s, vec![2, 5], guard);
-            assert!(!sl_remove(&s, 3, guard));
+            assert!(!sl_remove(&s, 3));
             assert_keys(&s, vec![2, 5], guard);
 
-            assert!(sl_remove(&s, 2, guard));
+            assert!(sl_remove(&s, 2));
             assert_keys(&s, vec![5], guard);
-            assert!(sl_remove(&s, 5, guard));
+            assert!(sl_remove(&s, 5));
             assert_keys(&s, vec![], guard);
 
-            sl_insert(&s, 3, 0, guard);
+            sl_insert(&s, 3, 0);
             assert_keys(&s, vec![3], guard);
-            sl_insert(&s, 1, 0, guard);
+            sl_insert(&s, 1, 0);
             assert_keys(&s, vec![1, 3], guard);
             // overwrite
-            assert!(!sl_insert(&s, 3, 0, guard));
+            assert!(!sl_insert(&s, 3, 0));
             assert_keys(&s, vec![1, 3], guard);
-            sl_insert(&s, 5, 0, guard);
+            sl_insert(&s, 5, 0);
             assert_keys(&s, vec![1, 3, 5], guard);
 
-            assert!(sl_remove(&s, 3, guard));
+            assert!(sl_remove(&s, 3));
             assert_keys(&s, vec![1, 5], guard);
-            assert!(sl_remove(&s, 1, guard));
+            assert!(sl_remove(&s, 1));
             assert_keys(&s, vec![5], guard);
-            assert!(!sl_remove(&s, 3, guard));
+            assert!(!sl_remove(&s, 3));
             assert_keys(&s, vec![5], guard);
-            assert!(sl_remove(&s, 5, guard));
+            assert!(sl_remove(&s, 5));
             assert_keys(&s, vec![], guard);
         }
     }
 
     #[test]
     fn get() {
-        let guard = &crossbeam_epoch::pin();
         let s = default_list();
-        sl_insert(&s, 30, 3, guard);
-        sl_insert(&s, 50, 5, guard);
-        sl_insert(&s, 10, 1, guard);
-        sl_insert(&s, 40, 4, guard);
-        sl_insert(&s, 20, 2, guard);
+        sl_insert(&s, 30, 3);
+        sl_insert(&s, 50, 5);
+        sl_insert(&s, 10, 1);
+        sl_insert(&s, 40, 4);
+        sl_insert(&s, 20, 2);
 
-        sl_get_assert(&s, 10, Some(1), guard);
-        sl_get_assert(&s, 20, Some(2), guard);
-        sl_get_assert(&s, 30, Some(3), guard);
-        sl_get_assert(&s, 40, Some(4), guard);
-        sl_get_assert(&s, 50, Some(5), guard);
+        sl_get_assert(&s, 10, Some(1));
+        sl_get_assert(&s, 20, Some(2));
+        sl_get_assert(&s, 30, Some(3));
+        sl_get_assert(&s, 40, Some(4));
+        sl_get_assert(&s, 50, Some(5));
 
-        sl_get_assert(&s, 7, None, guard);
-        sl_get_assert(&s, 27, None, guard);
-        sl_get_assert(&s, 31, None, guard);
-        sl_get_assert(&s, 97, None, guard);
+        sl_get_assert(&s, 7, None);
+        sl_get_assert(&s, 27, None);
+        sl_get_assert(&s, 31, None);
+        sl_get_assert(&s, 97, None);
     }
 
     #[test]
@@ -1196,7 +1183,7 @@ pub(crate) mod tests {
         let guard = &crossbeam_epoch::pin();
         let s = default_list();
         for &x in &[4, 2, 12, 8, 7, 11, 5] {
-            sl_insert(&s, x, x * 10, guard);
+            sl_insert(&s, x, x * 10);
         }
 
         assert_keys(&s, vec![2, 4, 5, 7, 8, 11, 12], guard);
@@ -1204,7 +1191,7 @@ pub(crate) mod tests {
         let mut it = s.iter();
         it.seek_to_first();
         // `it` is already pointing on 2
-        sl_remove(&s, 2, guard);
+        sl_remove(&s, 2);
         let k = construct_key(2);
         assert_eq!(it.key(), &k);
         // init another iter (it2), `it2` should not read `2`
@@ -1213,17 +1200,17 @@ pub(crate) mod tests {
         assert_ne!(it2.key(), &k);
 
         // deleting the next key that the iterator would point to makes the iterator skip the key
-        sl_remove(&s, 4, guard);
+        sl_remove(&s, 4);
         it.next();
         let k = construct_key(5);
         assert_eq!(it.key(), &k);
 
-        sl_remove(&s, 8, guard);
+        sl_remove(&s, 8);
         it.next();
         let k = construct_key(7);
         assert_eq!(it.key(), &k);
 
-        sl_remove(&s, 12, guard);
+        sl_remove(&s, 12);
         it.next();
         let k = construct_key(11);
         assert_eq!(it.key(), &k);
@@ -1237,9 +1224,8 @@ pub(crate) mod tests {
         let insert = [0, 4, 2, 12, 8, 7, 11, 5];
         let s = default_list();
 
-        let guard = &crossbeam_epoch::pin();
         for i in insert {
-            sl_insert(&s, i, i * 10, guard);
+            sl_insert(&s, i, i * 10);
         }
 
         let mut iter = s.iter();
@@ -1262,9 +1248,8 @@ pub(crate) mod tests {
         let insert = [0, 4, 2, 12, 8, 7, 11, 5];
         let s = default_list();
 
-        let guard = &crossbeam_epoch::pin();
         for i in insert {
-            sl_insert(&s, i, i * 10, guard);
+            sl_insert(&s, i, i * 10);
         }
 
         let mut iter = s.iter();
@@ -1290,7 +1275,6 @@ pub(crate) mod tests {
             );
             let n = 50000;
             for i in (0..n).step_by(3) {
-                let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i).into_bytes();
                 let v = format!("v{:04}", i).into_bytes();
                 sl.put(k, v);
@@ -1298,7 +1282,6 @@ pub(crate) mod tests {
             let sl1 = sl.clone();
             let h1 = thread::spawn(move || {
                 for i in (1..n).step_by(3) {
-                    let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i).into_bytes();
                     let v = format!("v{:04}", i).into_bytes();
                     sl1.put(k, v);
@@ -1307,7 +1290,6 @@ pub(crate) mod tests {
             let sl1 = sl.clone();
             let h2 = thread::spawn(move || {
                 for i in (0..n).step_by(3) {
-                    let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
                     sl1.remove(k.as_bytes());
                 }
@@ -1316,7 +1298,6 @@ pub(crate) mod tests {
             let sl1 = sl.clone();
             let h3 = thread::spawn(move || {
                 for i in (0..n).step_by(3) {
-                    let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
                     sl1.remove(k.as_bytes());
                 }
@@ -1325,7 +1306,6 @@ pub(crate) mod tests {
             let sl1 = sl.clone();
             let h4 = thread::spawn(move || {
                 for i in (2..n).step_by(3) {
-                    let guard = &crossbeam_epoch::pin();
                     let k = format!("k{:04}", i);
                     sl1.remove(k.as_bytes());
                 }
@@ -1337,7 +1317,6 @@ pub(crate) mod tests {
             h4.join().unwrap();
 
             for i in (1..n).step_by(3) {
-                let guard = &crossbeam_epoch::pin();
                 let k = format!("k{:04}", i);
                 let v = format!("v{:04}", i);
                 assert_eq!(sl.get(k.as_bytes()).unwrap().value(), v.as_bytes());
