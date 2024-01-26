@@ -37,11 +37,7 @@ fn construct_key(i: u64) -> Vec<u8> {
 #[bench]
 fn insert(b: &mut Bencher) {
     b.iter(|| {
-        let map = Skiplist::new(
-            ByteWiseComparator {},
-            Arc::new(DummyLimiter::default()),
-            crossbeam_epoch::default_collector().clone(),
-        );
+        let map = Skiplist::new(ByteWiseComparator {}, Arc::new(DummyLimiter::default()));
 
         let mut num = 0 as u64;
         for _ in 0..1_000 {

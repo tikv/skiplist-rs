@@ -9,7 +9,6 @@ fn concurrent_put_and_remove() {
         let sl = Skiplist::<ByteWiseComparator, RecorderLimiter>::new(
             ByteWiseComparator {},
             Arc::default(),
-            crossbeam_epoch::default_collector().clone(),
         );
         let n = 50;
         for i in (0..n).step_by(3) {
