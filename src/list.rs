@@ -14,9 +14,9 @@ use std::{
 
 use bytes::Bytes;
 use crossbeam_epoch::{self, default_collector, pin, Collector, Guard, Shared};
-use crossbeam_utils::cache_padded::CachePadded;
 
 use crossbeam_epoch::Atomic;
+use crossbeam_utils::CachePadded;
 
 use crate::{Bound, MemoryLimiter};
 
@@ -385,10 +385,11 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
     ) -> Option<Shared<'a, Node>> {
         // If `succ` is marked, that means `curr` is removed. Let's try
         // unlinking it from the skip list at this level.
-        match pred.compare_and_set(
+        match pred.compare_exchange(
             Shared::from(curr as *const _),
             succ.with_tag(0),
             Ordering::Release,
+            Ordering::Relaxed,
             guard,
         ) {
             Ok(_) => {
@@ -580,9 +581,10 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                         let succ = n.tower[level].load(Ordering::SeqCst, guard).with_tag(0);
 
                         if search.left[level][level]
-                            .compare_and_set(
+                            .compare_exchange(
                                 Shared::from(n as *const _),
                                 succ,
+                                Ordering::SeqCst,
                                 Ordering::SeqCst,
                                 guard,
                             )
@@ -633,7 +635,13 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
                 // Try installing the new node into the skip list (at level 0).
                 if search.left[0][0]
-                    .compare_and_set(search.right[0], node, Ordering::SeqCst, guard)
+                    .compare_exchange(
+                        search.right[0],
+                        node,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                        guard,
+                    )
                     .is_ok()
                 {
                     break;
@@ -676,7 +684,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
                     // operation fails, that means another thread has marked the pointer and we
                     // should stop building the tower.
                     if n.tower[level]
-                        .compare_and_set(next, succ, Ordering::SeqCst, guard)
+                        .compare_exchange(next, succ, Ordering::SeqCst, Ordering::SeqCst, guard)
                         .is_err()
                     {
                         break 'build;
@@ -688,7 +696,7 @@ impl<C: KeyComparator, M: MemoryLimiter> Skiplist<C, M> {
 
                     // Try installing the new node at the current level.
                     if pred[level]
-                        .compare_and_set(succ, node, Ordering::SeqCst, guard)
+                        .compare_exchange(succ, node, Ordering::SeqCst, Ordering::SeqCst, guard)
                         .is_ok()
                     {
                         // Success! Continue on the next level.
