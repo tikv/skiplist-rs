@@ -5,14 +5,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[features]
-default = ["failpoints"]
-failpoints = ["fail/failpoints"]
-
 [dependencies]
 crossbeam-epoch = "0.9"
 crossbeam-utils = "0.8"
-scopeguard = {version = "0.3.0", default-features = false}
+scopeguard = {version = "1.1.0", default-features = false}
 bytes = "1"
 rand = "0.8.4"
 slog = "2.2"
