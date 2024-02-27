@@ -5,6 +5,9 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+failpoints = ["fail/failpoints"]
+
 [dependencies]
 crossbeam-epoch = "0.9"
 crossbeam-utils = "0.8"
