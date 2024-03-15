@@ -6,22 +6,28 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-failpoints = ["fail/failpoints"]
+default = ["std"]
+
+# Enable to use APIs that require `std`.
+# This is enabled by default.
+std = ["alloc", "crossbeam-epoch/std", "crossbeam-utils/std"]
+
+# Enable to use APIs that require `alloc`.
+# This is enabled by default and also enabled if the `std` feature is enabled.
+#
+# NOTE: Disabling both `std` *and* `alloc` features is not supported yet.
+alloc = ["crossbeam-epoch/alloc"]
 
 [dependencies]
-crossbeam-epoch = "0.9"
-crossbeam-utils = "0.8"
-scopeguard = {version = "1.1.0", default-features = false}
-bytes = "1"
-rand = "0.8.4"
-slog = "2.2"
-fail = "0.5"
+crossbeam-epoch = { version = "0.9", default-features = false }
+crossbeam-utils = { version = "0.8", default-features = false }
 
 [dev-dependencies]
-loom = "0.7"
+rand = "0.8"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.5"
-
-[dependencies.tikv-jemalloc-ctl]
-version = "0.5.0"
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+single_use_lifetimes = "warn"
+unreachable_pub = "warn"
+# unsafe_op_in_unsafe_fn = "warn" # Set at crate-level instead since https://github.com/rust-lang/rust/pull/100081 is not available on MSRV
